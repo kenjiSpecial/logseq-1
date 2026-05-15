@@ -18,6 +18,8 @@
             [frontend.db.react :as react]
             [frontend.error :as error]
             [frontend.extensions.srs :as srs]
+            [frontend.fs :as fs]
+            [frontend.fs.server-graph :as server-graph]
             [frontend.handler.command-palette :as command-palette]
             [frontend.handler.events :as events]
             [frontend.handler.file :as file-handler]
@@ -41,6 +43,7 @@
             [frontend.util.persist-var :as persist-var]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
+            [logseq.graph-parser.util :as gp-util]
             [promesa.core :as p]
             [frontend.mobile.core :as mobile]))
 
@@ -71,6 +74,27 @@
     (f)
     (js/setInterval f 5000)))
 
+(defn- server-graph-file->db-file
+  [{:keys [path content size mtime]}]
+  {:file/path (gp-util/path-normalize path)
+   :file/content content
+   :file/size size
+   :file/last-modified-at mtime})
+
+(defn- load-server-graph!
+  [repo]
+  (when (and (server-graph/enabled?)
+             (= repo server-graph/default-repo))
+    (p/let [repo-dir (config/get-repo-dir repo)
+            result (fs/get-files repo-dir)
+            file-objs (mapv server-graph-file->db-file (:files result))]
+      (repo-handler/start-repo-db-if-not-exists! repo)
+      (repo-handler/load-new-repo-to-db!
+       repo
+       {:new-graph? true
+        :empty-graph? (empty? file-objs)
+        :file-objs file-objs}))))
+
 (defn- instrument!
   []
   (let [total (srs/get-srs-cards-total)]
@@ -78,7 +102,11 @@
 
 (defn restore-and-setup!
   [repos]
-  (when-let [repo (or (state/get-current-repo) (:url (first repos)))]
+  (when-let [repo (if (server-graph/enabled?)
+                    server-graph/default-repo
+                    (or (state/get-current-repo) (:url (first repos))))]
+    (when (server-graph/enabled?)
+      (state/set-current-repo! repo))
     (-> (db/restore! repo)
         (p/then
          (fn []
@@ -86,7 +114,8 @@
            (ui-handler/add-style-if-exists!)
 
            (->
-            (p/do! (repo-config-handler/start {:repo repo})
+            (p/do! (load-server-graph! repo)
+                   (repo-config-handler/start {:repo repo})
                    (when (config/global-config-enabled?)
                      (global-config-handler/start {:repo repo}))
                    (when (config/plugin-config-enabled?)
@@ -97,7 +126,8 @@
                 (shortcut/refresh!)
 
                 (cond
-                  (and (not (seq (db/get-files config/local-repo)))
+                  (and (not (server-graph/enabled?))
+                       (not (seq (db/get-files config/local-repo)))
                        ;; Not native local directory
                        (not (some config/local-db? (map :url repos)))
                        (not (mobile-util/native-platform?)))
@@ -110,7 +140,8 @@
          (fn []
            (js/console.log "db restored, setting up repo hooks")
 
-           (state/pub-event! [:modal/nfs-ask-permission])
+           (when-not (server-graph/enabled?)
+             (state/pub-event! [:modal/nfs-ask-permission]))
 
            (page-handler/init-commands!)
 
@@ -161,9 +192,11 @@
 ;; FIXME: Another get-repos implementation at src\main\frontend\handler\repo.cljs
 (defn- get-repos
   []
-  (p/let [nfs-dbs (db-persist/get-all-graphs)]
-    ;; TODO: Better IndexDB migration handling
-    (cond
+  (if (server-graph/enabled?)
+    (p/resolved [(server-graph/repo-entry)])
+    (p/let [nfs-dbs (db-persist/get-all-graphs)]
+      ;; TODO: Better IndexDB migration handling
+      (cond
       (and (mobile-util/native-platform?)
            (some #(or (string/includes? % " ")
                       (string/includes? % "logseq_local_/")) nfs-dbs))
@@ -181,7 +214,7 @@
 
       :else
       [{:url config/local-repo
-        :example? true}])))
+        :example? true}]))))
 
 (defn- register-components-fns!
   []
