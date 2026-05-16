@@ -2,6 +2,7 @@
   "App config and fns built on top of configuration"
   (:require [clojure.set :as set]
             [clojure.string :as string]
+            [frontend.journal-mobile.config :as journal-mobile-config]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
             [frontend.util :as util]
@@ -386,9 +387,12 @@
 
     (and (mobile-util/native-platform?) (local-db? repo-url))
     (let [dir (get-local-dir repo-url)]
-      (if (string/starts-with? dir "file://")
+      (if (and (journal-mobile-config/enabled?)
+               (= repo-url (journal-mobile-config/local-graph-repo)))
         dir
-        (path/path-join "file://" dir)))
+        (if (string/starts-with? dir "file://")
+          dir
+          (path/path-join "file://" dir))))
 
     ;; Special handling for demo graph
     (= repo-url "local")

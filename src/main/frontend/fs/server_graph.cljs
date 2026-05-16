@@ -7,6 +7,7 @@
   (:require [clojure.string :as string]
             [frontend.db :as db]
             [frontend.fs.protocol :as protocol]
+            [frontend.journal-mobile.config :as journal-mobile-config]
             [frontend.util :as util]
             [logseq.common.path :as path]
             [logseq.graph-parser.util :as gp-util]
@@ -27,10 +28,11 @@
   (let [location (.-location js/window)
         params (js/URLSearchParams. (.-search location))
         host (.-hostname location)]
-    (or (= "1" (.get params "server-graph"))
-        (= "true" (.get params "server-graph"))
-        (= "1" (js/localStorage.getItem "logseq.serverGraph"))
-        (= "journal.pa-to-po.dev" host))))
+    (and (not (journal-mobile-config/enabled?))
+         (or (= "1" (.get params "server-graph"))
+             (= "true" (.get params "server-graph"))
+             (= "1" (js/localStorage.getItem "logseq.serverGraph"))
+             (= "journal.pa-to-po.dev" host)))))
 
 (defn repo-entry
   []

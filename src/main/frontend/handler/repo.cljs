@@ -17,6 +17,8 @@
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.global-config :as global-config-handler]
             [frontend.idb :as idb]
+            [frontend.journal-mobile.config :as journal-mobile-config]
+            [frontend.journal-mobile.local-graph :as journal-local-graph]
             [frontend.search :as search]
             [frontend.spec :as spec]
             [frontend.state :as state]
@@ -474,6 +476,8 @@
   []
   (if (server-graph/enabled?)
     (p/resolved [(server-graph/repo-entry)])
+    (if (journal-mobile-config/enabled?)
+      (p/resolved [(journal-local-graph/repo-entry)])
     (p/let [nfs-dbs (db-persist/get-all-graphs)
           nfs-dbs (map (fn [db]
                          {:url db
@@ -495,7 +499,7 @@
 
       :else
       [{:url config/local-repo
-        :example? true}]))))
+        :example? true}])))))
 
 (defn combine-local-&-remote-graphs
   [local-repos remote-repos]

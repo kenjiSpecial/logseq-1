@@ -2,10 +2,11 @@ import { CapacitorConfig } from '@capacitor/cli'
 import fs from 'fs'
 
 const version = fs.readFileSync('static/package.json', 'utf8').match(/"version": "(.*?)"/)?.at(1) ?? '0.0.0'
+const journalAndroid = process.env.LOGSEQ_JOURNAL_ANDROID === '1' || process.env.LOGSEQ_JOURNAL_ANDROID === 'true'
 
 const config: CapacitorConfig = {
-  appId: 'com.logseq.app',
-  appName: 'Logseq',
+  appId: journalAndroid ? 'dev.patopo.journal' : 'com.logseq.app',
+  appName: journalAndroid ? 'Journal' : 'Logseq',
   bundledWebRuntime: false,
   webDir: 'public',
   plugins: {
@@ -35,7 +36,7 @@ const config: CapacitorConfig = {
   }
 }
 
-if (process.env.LOGSEQ_APP_SERVER_URL) {
+if (!journalAndroid && process.env.LOGSEQ_APP_SERVER_URL) {
   Object.assign(config, {
     server: {
       url: process.env.LOGSEQ_APP_SERVER_URL,
