@@ -97,10 +97,12 @@
 (defn write-file!
   [repo dir rpath content opts]
   (when content
-    (let [path (gp-util/path-normalize rpath)
+    (let [raw-rpath rpath
+          path (gp-util/path-normalize rpath)
           fs-record (get-fs dir)]
       (->
        (p/let [opts (assoc opts
+                           :raw-rpath raw-rpath
                            :error-handler
                            (fn [error]
                              (state/pub-event! [:capture-error {:error error

@@ -4,6 +4,7 @@
             [cljs-bean.core :as bean]
             [clojure.string :as string]
             [frontend.journal-mobile.config :as journal-config]
+            [frontend.journal-mobile.dirty-queue :as dirty-queue]
             [frontend.util :as util]
             [logseq.common.path :as path]
             [logseq.graph-parser.util :as gp-util]
@@ -112,8 +113,10 @@
      (mkdir-recur! (path/path-join root "pages"))
      (mkdir-recur! (path/path-join root "assets"))
      (mkdir-recur! (path/path-join root "logseq"))
+     (mkdir-recur! (dirty-queue/sync-dir))
      (write-file-if-missing! (path/path-join root "logseq/config.edn")
                              minimal-config-edn)
+     (dirty-queue/initialize!)
      {:repo (graph-repo)
       :dir root})))
 
@@ -125,6 +128,17 @@
                :data)
       (p/catch (fn [_] nil))))
 
+(defn read-file-content
+  [rpath]
+  (if-let [rpath (dirty-queue/normalize-relative-path rpath)]
+    (if (dirty-queue/ignored-path? rpath)
+      (p/rejected (js/Error. (str "Ignored Journal file path: " (pr-str rpath))))
+      (p/let [content (read-file (path/path-join (graph-dir) rpath))]
+        (if (nil? content)
+          (p/rejected (js/Error. (str "Unable to read Journal file content: " (pr-str rpath))))
+          content)))
+    (p/rejected (js/Error. (str "Invalid Journal file path: " (pr-str rpath))))))
+
 (defn- readdir
   [fpath]
   (-> (p/chain (.readdir Filesystem (filesystem-opts fpath nil))
@@ -132,7 +146,7 @@
                :files)
       (p/catch (fn [_] nil))))
 
-(def allowed-exts #{"md" "markdown" "org" "edn" "css"})
+(def allowed-exts #{"md" "markdown" "org" "edn" "css" "js" "excalidraw"})
 
 (defn- ignored-path?
   [rpath]

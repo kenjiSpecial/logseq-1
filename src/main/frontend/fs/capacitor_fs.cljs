@@ -8,6 +8,8 @@
             [frontend.db :as db]
             [frontend.fs.protocol :as protocol]
             [frontend.journal-mobile.config :as journal-config]
+            [frontend.journal-mobile.dirty-queue :as dirty-queue]
+            [frontend.journal-mobile.sync :as journal-sync]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
             [frontend.util :as util]
@@ -55,6 +57,43 @@
   [root fpath]
   (or (= fpath root)
       (string/starts-with? fpath (str root "/"))))
+
+(defn- journal-relative-path
+  [dir rpath raw-rpath]
+  (when (journal-config/enabled?)
+    (let [raw-dir (some-> dir string/trim)
+          raw-rpath (some-> (or raw-rpath rpath) string/trim)]
+      (when-not (or (unsafe-journal-path? raw-dir)
+                    (unsafe-journal-path? raw-rpath))
+        (let [root (validate-journal-data-path! "local graph dir" (journal-config/local-graph-dir))
+              dir (path/path-normalize raw-dir)
+              rpath (path/path-normalize raw-rpath)
+              fpath (when (and dir rpath) (path/path-join dir rpath))]
+          (cond
+            (and dir (= dir root) rpath)
+            rpath
+
+            (and fpath (under-journal-root? root fpath))
+            (subs fpath (inc (count root)))
+
+            :else
+            nil))))))
+
+(defn- enqueue-journal-put!
+  [dir rpath raw-rpath]
+  (try
+    (if-let [rpath (journal-relative-path dir rpath raw-rpath)]
+      (p/catch
+       (p/let [_ (dirty-queue/enqueue-put! rpath)]
+         (journal-sync/schedule!)
+         nil)
+       (fn [error]
+         (log/error :journal-mobile/dirty-queue-enqueue-failed error)
+         (p/rejected error)))
+      (p/resolved nil))
+    (catch :default error
+      (log/error :journal-mobile/dirty-queue-enqueue-failed error)
+      (p/rejected error))))
 
 (defn- journal-data-path
   [fpath]
@@ -263,11 +302,18 @@
     (truncate-old-versioned-files! file-root)))
 
 (defn- write-file-impl!
-  [repo dir rpath content {:keys [ok-handler error-handler old-content skip-compare?]} stat]
-  (let [fpath (path/path-join dir rpath)]
+  [repo dir rpath content {:keys [ok-handler error-handler old-content skip-compare? raw-rpath]} stat]
+  (let [raw-rpath (or raw-rpath rpath)
+        invalid-journal-rpath? (and (journal-config/enabled?)
+                                    (unsafe-journal-path? raw-rpath))
+        fpath (path/path-join dir rpath)]
+    (when invalid-journal-rpath?
+      (throw (js/Error. (str "Invalid Journal write path: " (pr-str raw-rpath)))))
     (if (or (string/blank? repo) skip-compare?)
       (p/catch
-       (p/let [result (<write-file-with-utf8 fpath content)]
+       (p/let [result (<write-file-with-utf8 fpath content)
+               _ (when result
+                   (enqueue-journal-put! dir rpath raw-rpath))]
          (when ok-handler
            (ok-handler repo fpath result)))
        (fn [error]
@@ -297,7 +343,9 @@
           (->
            (p/let [result (<write-file-with-utf8 fpath content)
                    mtime (-> (js->clj stat :keywordize-keys true)
-                             :mtime)]
+                             :mtime)
+                   _ (when result
+                       (enqueue-journal-put! dir rpath raw-rpath))]
              (when-not contents-matched?
                (backup-file repo-dir :backup-dir fpath disk-content))
              (db/set-file-last-modified-at! repo rpath mtime)

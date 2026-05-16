@@ -33,6 +33,7 @@
             [frontend.handler.user :as user-handler]
             [frontend.idb :as idb]
             [frontend.journal-mobile.local-graph :as journal-local-graph]
+            [frontend.journal-mobile.sync :as journal-sync]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
             [frontend.modules.outliner.datascript :as outliner-db]
@@ -106,7 +107,8 @@
        repo
        {:new-graph? true
         :empty-graph? (empty? file-objs)
-        :file-objs file-objs}))))
+        :file-objs file-objs})
+      (journal-sync/start!))))
 
 (defn- instrument!
   []
