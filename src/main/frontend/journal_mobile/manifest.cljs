@@ -3,6 +3,7 @@
   (:require ["@capacitor/filesystem" :refer [Directory Encoding Filesystem]]
             [cljs-bean.core :as bean]
             [clojure.set :as set]
+            [clojure.string :as string]
             [frontend.journal-mobile.config :as journal-config]
             [frontend.journal-mobile.dirty-queue :as dirty-queue]
             [logseq.graph-parser.util :as gp-util]
@@ -25,7 +26,12 @@
                   opts)))
 
 (defn- ensure-sync-dir! []
-  (.mkdir Filesystem (filesystem-opts (dirty-queue/sync-dir) {:recursive true})))
+  (p/catch
+   (.mkdir Filesystem (filesystem-opts (dirty-queue/sync-dir) {:recursive true}))
+   (fn [error]
+     (if (string/includes? (str error) "Directory exists")
+       nil
+       (p/rejected error)))))
 
 (defn- file-exists?
   [fpath]

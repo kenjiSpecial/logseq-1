@@ -60,7 +60,12 @@
   {:items []})
 
 (defn- ensure-sync-dir! []
-  (.mkdir Filesystem (filesystem-opts (sync-dir) {:recursive true})))
+  (p/catch
+   (.mkdir Filesystem (filesystem-opts (sync-dir) {:recursive true}))
+   (fn [error]
+     (if (string/includes? (str error) "Directory exists")
+       nil
+       (p/rejected error)))))
 
 (defn- file-exists?
   [fpath]
