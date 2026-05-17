@@ -22,7 +22,74 @@
 
 (def ^:private startup-delay-ms 4000)
 (def ^:private dirty-queue-delay-ms 3000)
+(def ^:private periodic-sync-interval-ms 60000)
 (defonce ^:private dirty-queue-timer (atom nil))
+(defonce ^:private periodic-sync-timer (atom nil))
+(defonce ^:private visibility-listener-registered? (atom false))
+(defonce ^:private after-pull-callback (atom nil))
+
+(declare sync-now!)
+
+(defn register-after-pull!
+  "Registers a callback invoked after remote files are downloaded. The callback
+  receives the pull summary and must return a promise or value."
+  [f]
+  (reset! after-pull-callback f))
+
+(defn- online?
+  []
+  (or (nil? (.-onLine js/navigator))
+      (true? (.-onLine js/navigator))))
+
+(defn- visible?
+  []
+  (not= "hidden" (.-visibilityState js/document)))
+
+(defn- trigger-sync!
+  [reason]
+  (cond
+    (not (journal-config/enabled?))
+    (p/resolved @state)
+
+    (not (online?))
+    (do
+      (log/info :journal-mobile/periodic-sync-skipped {:reason reason
+                                                       :cause :offline})
+      (p/resolved @state))
+
+    (:syncing? @state)
+    (do
+      (log/info :journal-mobile/periodic-sync-skipped {:reason reason
+                                                       :cause :already-syncing})
+      (p/resolved @state))
+
+    :else
+    (do
+      (log/info :journal-mobile/periodic-sync-start {:reason reason})
+      (p/catch
+       (p/chain (sync-now!)
+                (fn [result]
+                  (log/info :journal-mobile/periodic-sync-complete {:reason reason
+                                                                    :last-error (:last-error @state)})
+                  result))
+       (fn [error]
+         (swap! state assoc :last-error (str error))
+         (log/error :journal-mobile/periodic-sync-failed {:reason reason
+                                                          :error error})
+         nil)))))
+
+(defn- invoke-after-pull!
+  [summary]
+  (if-let [callback @after-pull-callback]
+    (p/catch
+     (p/let [result (callback summary)]
+       (log/info :journal-mobile/after-pull-callback-complete {:summary (select-keys summary [:downloaded :failed :skippedDirty :attempted])})
+       result)
+     (fn [error]
+       (log/error :journal-mobile/after-pull-callback-failed {:summary summary
+                                                              :error error})
+       {:error (str error)}))
+    (p/resolved nil)))
 
 (defn pull-remote-manifest!
   []
@@ -127,29 +194,40 @@
                  (conj results result))))))
 
 (defn- remote-pull!
-  [local remote]
-  (p/catch
-   (p/let [queued-paths (dirty-queue/queued-paths)
-           {:keys [downloads skipped-dirty]} (remote-pull-candidates local remote queued-paths)
-           results (pull-files-sequentially! downloads)
-           downloaded (count (filter #(= :downloaded (:status %)) results))
-           failures (filterv #(= :failed (:status %)) results)
-           summary {:downloaded downloaded
-                    :failed (count failures)
-                    :skippedDirty (count skipped-dirty)
-                    :attempted (count downloads)
-                    :failures failures
-                    :skippedDirtyPaths (vec (take 50 skipped-dirty))}]
-     (log/info :journal-mobile/remote-pull-complete summary)
-     summary)
-   (fn [error]
-     (let [summary {:downloaded 0
-                    :failed 1
-                    :skippedDirty 0
-                    :attempted 0
-                    :error (str error)}]
-       (log/error :journal-mobile/remote-pull-failed error)
-       summary))))
+  ([local remote]
+   (remote-pull! local remote #{}))
+  ([local remote protected-paths]
+   (p/catch
+    (p/let [queued-paths (dirty-queue/queued-paths)
+            protected-paths (set (concat queued-paths protected-paths))
+            {:keys [downloads skipped-dirty]} (remote-pull-candidates local remote protected-paths)
+            results (pull-files-sequentially! downloads)
+            downloaded-results (filterv #(= :downloaded (:status %)) results)
+            downloaded (count downloaded-results)
+            failures (filterv #(= :failed (:status %)) results)
+            summary {:downloaded downloaded
+                     :failed (count failures)
+                     :skippedDirty (count skipped-dirty)
+                     :attempted (count downloads)
+                     :results results
+                     :downloadedPaths (mapv :path downloaded-results)
+                     :failures failures
+                     :skippedDirtyPaths (vec (take 50 skipped-dirty))}
+            callback-result (when (pos? downloaded)
+                              (invoke-after-pull! summary))
+            summary (cond-> summary
+                      (:error callback-result)
+                      (assoc :callbackError (:error callback-result)))]
+      (log/info :journal-mobile/remote-pull-complete summary)
+      summary)
+    (fn [error]
+      (let [summary {:downloaded 0
+                     :failed 1
+                     :skippedDirty 0
+                     :attempted 0
+                     :error (str error)}]
+        (log/error :journal-mobile/remote-pull-failed error)
+        summary)))))
 
 (defn sync-now!
   []
@@ -169,8 +247,12 @@
                                          (log/error :journal-mobile/manifest-fetch-failed error)
                                          {:error (str error)}))
                remote (:remote remote-result)
+               failed-upload-paths (->> queue-results
+                                        (filter #(= :failed (:status %)))
+                                        (map :path)
+                                        set)
                pull-results (when remote
-                              (remote-pull! local remote))
+                              (remote-pull! local remote failed-upload-paths))
                pulled-file-objs (if remote
                                   (local-graph/files)
                                   file-objs)
@@ -181,7 +263,8 @@
                               (.toISOString (js/Date.)))
                diff (:diff snapshot)
                last-error (or (:error remote-result)
-                              (:error pull-results))]
+                              (:error pull-results)
+                              (:callbackError pull-results))]
          (swap! state assoc
                 :syncing? false
                 :last-check-at checked-at
@@ -217,24 +300,47 @@
             (js/setTimeout
              (fn []
                (reset! dirty-queue-timer nil)
-               (p/catch (sync-now!)
-                        (fn [error]
-                          (swap! state assoc :last-error (str error))
-                          (log/error :journal-mobile/scheduled-sync-failed error)
-                          nil)))
+               (trigger-sync! :dirty-queue))
              dirty-queue-delay-ms))))
+
+(defn- start-periodic-sync! []
+  (when (and (journal-config/enabled?)
+             (nil? @periodic-sync-timer))
+    (reset! periodic-sync-timer
+            (js/setInterval
+             (fn []
+               (trigger-sync! :interval))
+             periodic-sync-interval-ms))))
+
+(defn- start-visibility-sync! []
+  (when (and (journal-config/enabled?)
+             (not @visibility-listener-registered?))
+    (reset! visibility-listener-registered? true)
+    (.addEventListener js/document "visibilitychange"
+                       (fn []
+                         (when (visible?)
+                           (trigger-sync! :visibility))))))
+
+(defn stop!
+  []
+  (when-let [timer @dirty-queue-timer]
+    (js/clearTimeout timer)
+    (reset! dirty-queue-timer nil))
+  (when-let [timer @periodic-sync-timer]
+    (js/clearInterval timer)
+    (reset! periodic-sync-timer nil))
+  (swap! state assoc :started? false)
+  @state)
 
 (defn start!
   []
-  (when (and (journal-config/enabled?)
-             (not (:started? @state)))
-    (swap! state assoc :started? true)
-    (js/setTimeout
-     (fn []
-       (p/catch (maybe-sync!)
-                (fn [error]
-                  (swap! state assoc :last-error (str error))
-                  (log/error :journal-mobile/startup-sync-failed error)
-                  nil)))
-     startup-delay-ms))
+  (when (journal-config/enabled?)
+    (when-not (:started? @state)
+      (swap! state assoc :started? true)
+      (js/setTimeout
+       (fn []
+         (trigger-sync! :startup))
+       startup-delay-ms))
+    (start-periodic-sync!)
+    (start-visibility-sync!))
   @state)

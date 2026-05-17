@@ -97,10 +97,46 @@
         :empty-graph? (empty? file-objs)
         :file-objs file-objs}))))
 
+(defn- refresh-journal-local-graph-from-pull!
+  [{:keys [downloadedPaths] :as summary}]
+  (let [repo (journal-local-graph/graph-repo)
+        downloaded-paths (vec downloadedPaths)]
+    (if (or (not (journal-local-graph/enabled?))
+            (not= (state/get-current-repo) repo)
+            (empty? downloaded-paths))
+      (do
+        (log/info :journal-mobile/db-refresh-skipped {:summary (select-keys summary [:downloaded :failed :skippedDirty :attempted])
+                                                      :current-repo (state/get-current-repo)
+                                                      :repo repo})
+        (p/resolved nil))
+      (p/catch
+       (let [downloaded-path-set (set downloaded-paths)]
+         (p/let [file-objs (journal-local-graph/files)
+                 downloaded-file-objs (filterv #(contains? downloaded-path-set (:file/path %)) file-objs)
+                 delete-blocks (->> (db/delete-blocks repo downloaded-paths false)
+                                    (remove nil?))]
+           (log/info :journal-mobile/db-refresh-start {:downloadedPaths downloaded-paths
+                                                       :fileCount (count downloaded-file-objs)})
+           (repo-handler/start-repo-db-if-not-exists! repo)
+           (repo-handler/parse-files-and-load-to-db!
+            repo
+            downloaded-file-objs
+            {:delete-blocks delete-blocks
+             :re-render? true
+             :re-render-opts {:clear-all-query-state? true}
+             :refresh? true})
+           (log/info :journal-mobile/db-refresh-complete {:downloadedPaths downloaded-paths
+                                                          :fileCount (count downloaded-file-objs)})))
+       (fn [error]
+         (log/error :journal-mobile/db-refresh-failed {:summary summary
+                                                       :error error})
+         (p/rejected error))))))
+
 (defn- load-journal-local-graph!
   [repo]
   (when (and (journal-local-graph/enabled?)
              (= repo (journal-local-graph/graph-repo)))
+    (journal-sync/register-after-pull! refresh-journal-local-graph-from-pull!)
     (p/let [file-objs (journal-local-graph/files)]
       (repo-handler/start-repo-db-if-not-exists! repo)
       (repo-handler/load-new-repo-to-db!

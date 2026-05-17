@@ -1,7 +1,10 @@
 import { CapacitorConfig } from '@capacitor/cli'
 import fs from 'fs'
 
-const version = fs.readFileSync('static/package.json', 'utf8').match(/"version": "(.*?)"/)?.at(1) ?? '0.0.0'
+const packageJsonPath = fs.existsSync('static/package.json')
+  ? 'static/package.json'
+  : 'public/static/package.json'
+const version = fs.readFileSync(packageJsonPath, 'utf8').match(/"version": "(.*?)"/)?.at(1) ?? '0.0.0'
 const journalAndroid = process.env.LOGSEQ_JOURNAL_ANDROID === '1' || process.env.LOGSEQ_JOURNAL_ANDROID === 'true'
 
 const config: CapacitorConfig = {
