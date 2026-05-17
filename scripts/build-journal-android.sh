@@ -26,11 +26,13 @@ docker run --rm \
 rm -rf ./public/static
 rm -rf ./static/js/*.map
 mv static ./public
-rm -rf static
-cp -a public/static static
+
+# Do not copy Android/local-first public/static back to ./static or ./static-web.
+# ./static-web is the hosted journal.pa-to-po.dev server-graph bundle and must
+# only be produced by scripts/build-journal-web.sh.
 
 docker run --rm -v "$PWD:/work" alpine:3.20 \
-  sh -lc 'chown -R 1000:1000 /work/public/static /work/static /work/.cpcache 2>/dev/null || true'
+  sh -lc 'chown -R 1000:1000 /work/public/static /work/.cpcache 2>/dev/null || true'
 
 npx cap sync android
 (
