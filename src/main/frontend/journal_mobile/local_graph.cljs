@@ -139,6 +139,27 @@
           content)))
     (p/rejected (js/Error. (str "Invalid Journal file path: " (pr-str rpath))))))
 
+(defn write-remote-file!
+  "Writes a remotely downloaded graph file into app-private storage without
+  marking it dirty."
+  [rpath content]
+  (cond
+    (not (string? content))
+    (p/rejected (js/Error. (str "Invalid Journal remote file content: " (pr-str rpath))))
+
+    :else
+    (if-let [rpath (dirty-queue/normalize-relative-path rpath)]
+      (if (dirty-queue/ignored-path? rpath)
+        (p/rejected (js/Error. (str "Ignored Journal file path: " (pr-str rpath))))
+        (let [fpath (graph-path (graph-dir) rpath)
+              parent (path/parent fpath)]
+          (p/let [_ (when (seq parent)
+                      (mkdir-recur! parent))]
+            (.writeFile Filesystem (filesystem-opts fpath
+                                                    {:data content
+                                                     :encoding (.-UTF8 Encoding)})))))
+      (p/rejected (js/Error. (str "Invalid Journal file path: " (pr-str rpath)))))))
+
 (defn- readdir
   [fpath]
   (-> (p/chain (.readdir Filesystem (filesystem-opts fpath nil))

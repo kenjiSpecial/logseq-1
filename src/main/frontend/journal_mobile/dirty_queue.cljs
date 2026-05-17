@@ -323,6 +323,17 @@
   []
   (p/chain (load!) :items))
 
+(defn queued-paths
+  []
+  (p/chain
+   (items)
+   (fn [items]
+     (->> items
+          (filter #(= "put" (:op %)))
+          (keep (comp normalize-relative-path :path))
+          (remove ignored-path?)
+          set))))
+
 (defn pending-count
   []
   (p/chain (items) count))
