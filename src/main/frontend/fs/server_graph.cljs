@@ -84,6 +84,36 @@
           response (assert-ok! response)]
     (.text response)))
 
+(defn- readable-stream-like?
+  [content]
+  (and content
+       (fn? (.-getReader content))))
+
+(def asset-content-types
+  {"avif" "image/avif"
+   "bmp" "image/bmp"
+   "gif" "image/gif"
+   "jpeg" "image/jpeg"
+   "jpg" "image/jpeg"
+   "pdf" "application/pdf"
+   "png" "image/png"
+   "svg" "image/svg+xml"
+   "webp" "image/webp"})
+
+(defn- write-request-opts
+  [rpath content]
+  (let [stream? (readable-stream-like? content)
+        content-type (if stream?
+                       (get asset-content-types (util/get-file-ext rpath))
+                       "text/plain; charset=utf-8")
+        opts #js {:method "PUT"
+                  :body content}]
+    (when content-type
+      (set! (.-headers opts) #js {"content-type" content-type}))
+    (when stream?
+      (set! (.-duplex opts) "half"))
+    opts))
+
 (def allowed-file-exts #{"md" "markdown" "org" "excalidraw" "edn" "css" "js"})
 (def ignored-path-prefixes #{"." ".recycle" "node_modules" "logseq/bak"
                              "logseq/version-files"})
@@ -181,9 +211,7 @@
   (write-file! [_this repo dir rpath content _opts]
     (let [normalized (normalize-path dir rpath)]
       (p/let [result (fetch-json (api-url "/api/graph/file" normalized)
-                                 #js {:method "PUT"
-                                      :headers #js {"content-type" "text/plain; charset=utf-8"}
-                                      :body content})
+                                 (write-request-opts normalized content))
               stat (:stat result)]
         (db/set-file-content! repo normalized content)
         (db/set-file-last-modified-at! repo normalized (stat->mtime stat))
