@@ -100,19 +100,32 @@
    "svg" "image/svg+xml"
    "webp" "image/webp"})
 
+(defn- asset-content-type
+  [rpath]
+  (get asset-content-types (some-> (util/get-file-ext rpath) string/lower-case)))
+
+(defn- readable-stream->blob
+  [content content-type]
+  (p/let [blob (.blob (js/Response. content))]
+    (if content-type
+      (js/Blob. #js [blob] #js {:type content-type})
+      blob)))
+
 (defn- write-request-opts
   [rpath content]
   (let [stream? (readable-stream-like? content)
         content-type (if stream?
-                       (get asset-content-types (util/get-file-ext rpath))
+                       (asset-content-type rpath)
                        "text/plain; charset=utf-8")
         opts #js {:method "PUT"
                   :body content}]
-    (when content-type
-      (set! (.-headers opts) #js {"content-type" content-type}))
-    (when stream?
-      (set! (.-duplex opts) "half"))
-    opts))
+    (p/let [body (if stream?
+                   (readable-stream->blob content content-type)
+                   content)]
+      (set! (.-body opts) body)
+      (when content-type
+        (set! (.-headers opts) #js {"content-type" content-type}))
+      opts)))
 
 (def allowed-file-exts #{"md" "markdown" "org" "excalidraw" "edn" "css" "js"})
 (def ignored-path-prefixes #{"." ".recycle" "node_modules" "logseq/bak"
@@ -210,8 +223,8 @@
 
   (write-file! [_this repo dir rpath content _opts]
     (let [normalized (normalize-path dir rpath)]
-      (p/let [result (fetch-json (api-url "/api/graph/file" normalized)
-                                 (write-request-opts normalized content))
+      (p/let [opts (write-request-opts normalized content)
+              result (fetch-json (api-url "/api/graph/file" normalized) opts)
               stat (:stat result)]
         (db/set-file-content! repo normalized content)
         (db/set-file-last-modified-at! repo normalized (stat->mtime stat))
