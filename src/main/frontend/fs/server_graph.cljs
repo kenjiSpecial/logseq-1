@@ -4,12 +4,13 @@
    This backend keeps the normal Logseq auto-save pipeline intact: editor changes
    still call frontend.fs/write-file!, and this implementation persists those
    writes immediately to /api/graph/file on the server."
-  (:require [clojure.string :as string]
+  (:require [clojure.set :as set]
+            [clojure.string :as string]
             [frontend.db :as db]
             [frontend.fs.protocol :as protocol]
             [frontend.journal-mobile.config :as journal-mobile-config]
+            [frontend.state :as state]
             [frontend.util :as util]
-            [logseq.common.path :as path]
             [logseq.graph-parser.util :as gp-util]
             [promesa.core :as p]))
 
@@ -17,6 +18,9 @@
 (def default-graph-name "journal")
 (def default-dir (str graph-dir-prefix default-graph-name))
 (def default-repo (str "logseq_local_" default-dir))
+(def poll-interval-ms 5000)
+
+(defonce *watchers (atom {}))
 
 (defn server-graph-dir?
   [dir]
@@ -156,6 +160,45 @@
       (.getTime (js/Date. mtime))
       mtime)))
 
+(defn manifest-entry->snapshot
+  [{:keys [path etag size type] :as entry}]
+  (let [entry (-> entry
+                  (assoc :path (normalize-path default-dir path))
+                  (update :type #(or % "file")))]
+    (when (allowed-file? entry)
+      {:path (:path entry)
+       :etag etag
+       :size size
+       :mtime (stat->mtime entry)
+       :type (:type entry)})))
+
+(defn manifest->snapshot
+  [manifest]
+  (->> (:entries manifest)
+       (keep manifest-entry->snapshot)
+       (map (juxt :path identity))
+       (into {})))
+
+(defn diff-manifest-snapshots
+  [previous current]
+  (let [previous-paths (set (keys previous))
+        current-paths (set (keys current))
+        sorted-entries (fn [entries]
+                         (vec (sort-by :path entries)))]
+    {:added (->> (set/difference current-paths previous-paths)
+                 (map current)
+                 sorted-entries)
+     :changed (->> (set/intersection previous-paths current-paths)
+                   (keep (fn [rpath]
+                           (let [before (get previous rpath)
+                                 after (get current rpath)]
+                             (when (not= (:etag before) (:etag after))
+                               after))))
+                   sorted-entries)
+     :deleted (->> (set/difference previous-paths current-paths)
+                   (map previous)
+                   sorted-entries)}))
+
 (defn- file-entry->db-file
   [{:keys [path size mtime type content] :as entry}]
   {:name (last (string/split path #"/"))
@@ -191,6 +234,87 @@
                                [])))
                          entries))]
     (vec (mapcat identity children))))
+
+(defn- watch-event-path
+  [dir rpath]
+  (str (or dir default-dir) "/" rpath))
+
+(defn- snapshot->stat
+  [{:keys [path size mtime type]}]
+  {:path path
+   :size size
+   :mtime mtime
+   :type type})
+
+(defn- publish-watch-event!
+  [dir event snapshot content]
+  (state/pub-event!
+   [:mobile-file-watcher/changed
+    (clj->js
+     {:event event
+      :dir dir
+      :path (watch-event-path dir (:path snapshot))
+      :content content
+      :stat (snapshot->stat snapshot)})]))
+
+(defn- fetch-manifest
+  []
+  (fetch-json "/api/graph/manifest" nil))
+
+(defn- publish-add-or-change!
+  [dir event snapshot]
+  (p/let [content (fetch-text (api-url "/api/graph/file" (:path snapshot)))]
+    (publish-watch-event! dir event snapshot content)))
+
+(defn- publish-diff!
+  [dir {:keys [added changed deleted]}]
+  (doseq [snapshot deleted]
+    (publish-watch-event! dir "unlink" snapshot nil))
+  (p/all
+   (concat
+    (map #(publish-add-or-change! dir "add" %) added)
+    (map #(publish-add-or-change! dir "change" %) changed))))
+
+(defn- update-watcher!
+  [dir f]
+  (swap! *watchers update dir (fn [watcher]
+                                (when watcher
+                                  (f watcher)))))
+
+(defn- poll-watch-dir!
+  [dir]
+  (let [watcher (get @*watchers dir)]
+    (when (and watcher (not (:polling? watcher)))
+      (update-watcher! dir #(assoc % :polling? true))
+      (->
+       (p/let [manifest (fetch-manifest)
+               snapshot (manifest->snapshot manifest)
+               previous (:snapshot (get @*watchers dir))
+               _ (when previous
+                   (publish-diff! dir (diff-manifest-snapshots previous snapshot)))]
+         (update-watcher! dir #(assoc % :snapshot snapshot
+                                      :polling? false)))
+       (p/catch
+        (fn [error]
+          (js/console.error "Server Graph watcher poll failed" error)
+          (update-watcher! dir #(assoc % :polling? false))))))))
+
+(defn- start-watch-dir!
+  [dir]
+  (let [dir (or dir default-dir)]
+    (when-not (contains? @*watchers dir)
+      (let [interval-id (js/setInterval #(poll-watch-dir! dir) poll-interval-ms)]
+        (swap! *watchers assoc dir {:interval-id interval-id
+                                    :snapshot nil
+                                    :polling? false})
+        (poll-watch-dir! dir)))))
+
+(defn- stop-watch-dir!
+  [dir]
+  (let [dir (or dir default-dir)]
+    (when-let [interval-id (get-in @*watchers [dir :interval-id])]
+      (js/clearInterval interval-id))
+    (swap! *watchers dissoc dir)))
 
 (defrecord ServerGraphFs []
   protocol/Fs
@@ -264,8 +388,8 @@
       {:path default-dir
        :files files}))
 
-  (watch-dir! [_this _dir _options]
-    nil)
+  (watch-dir! [_this dir _options]
+    (start-watch-dir! dir))
 
-  (unwatch-dir! [_this _dir]
-    nil))
+  (unwatch-dir! [_this dir]
+    (stop-watch-dir! dir)))
