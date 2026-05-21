@@ -41,6 +41,7 @@
                            frontend.config/ENABLE-FILE-SYNC-PRODUCTION #shadow/env ["ENABLE_FILE_SYNC_PRODUCTION" :as :bool :default true]
                            frontend.config/TEST #shadow/env ["LOGSEQ_CI" :as :bool :default false]
                            frontend.config/REVISION #shadow/env ["LOGSEQ_REVISION" :default "dev"]
+                           frontend.fs.server-graph/ENABLED #shadow/env ["LOGSEQ_SERVER_GRAPH" :default "false"]
                            frontend.journal-mobile.config/ENABLED #shadow/env ["LOGSEQ_JOURNAL_ANDROID" :default "false"]
                            frontend.journal-mobile.config/API-BASE-URL #shadow/env ["LOGSEQ_JOURNAL_API_BASE_URL" :default "https://journal.pa-to-po.dev"]
                            frontend.journal-mobile.config/LOCAL-GRAPH-DIR #shadow/env ["LOGSEQ_JOURNAL_LOCAL_GRAPH_DIR" :default "journal/graph"]

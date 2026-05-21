@@ -6,6 +6,9 @@
   (is (true? (server-graph/server-graph-dir? "server-graph://journal")))
   (is (false? (server-graph/server-graph-dir? "journal"))))
 
+(deftest server-graph-build-flag-defaults-off
+  (is (false? (server-graph/build-enabled?))))
+
 (deftest path-normalization-removes-server-graph-prefix
   (is (= "pages/today.md"
          (server-graph/normalize-path "server-graph://journal" "pages/today.md")))

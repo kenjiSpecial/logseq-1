@@ -19,6 +19,7 @@
 (def default-dir (str graph-dir-prefix default-graph-name))
 (def default-repo (str "logseq_local_" default-dir))
 (def poll-interval-ms 5000)
+(goog-define ENABLED "false")
 
 (defonce *watchers (atom {}))
 
@@ -27,13 +28,18 @@
   (and (string? dir)
        (string/starts-with? dir graph-dir-prefix)))
 
+(defn build-enabled?
+  []
+  (contains? #{"1" "true"} ENABLED))
+
 (defn enabled?
   []
   (let [location (.-location js/window)
         params (js/URLSearchParams. (.-search location))
         host (.-hostname location)]
     (and (not (journal-mobile-config/enabled?))
-         (or (= "1" (.get params "server-graph"))
+         (or (build-enabled?)
+             (= "1" (.get params "server-graph"))
              (= "true" (.get params "server-graph"))
              (= "1" (js/localStorage.getItem "logseq.serverGraph"))
              (= "journal.pa-to-po.dev" host)))))

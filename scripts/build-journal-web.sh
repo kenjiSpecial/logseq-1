@@ -7,6 +7,7 @@ cd "$(dirname "$0")/.."
 # Keep this separate from Android/Capacitor's public/static output so mobile
 # builds cannot replace the server-graph web bundle with a local-first bundle.
 export LOGSEQ_JOURNAL_ANDROID=false
+export LOGSEQ_SERVER_GRAPH=true
 export LOGSEQ_JOURNAL_API_BASE_URL="${LOGSEQ_JOURNAL_API_BASE_URL:-https://journal.pa-to-po.dev}"
 
 WEB_STATIC_DIR="${LOGSEQ_JOURNAL_WEB_STATIC_DIR:-static-web}"
@@ -20,6 +21,7 @@ npm run gulp:build
 docker run --rm \
   -e HOME=/tmp \
   -e LOGSEQ_JOURNAL_ANDROID="$LOGSEQ_JOURNAL_ANDROID" \
+  -e LOGSEQ_SERVER_GRAPH="$LOGSEQ_SERVER_GRAPH" \
   -e LOGSEQ_JOURNAL_API_BASE_URL="$LOGSEQ_JOURNAL_API_BASE_URL" \
   -v "$PWD:/work" \
   -w /work \
