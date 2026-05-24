@@ -152,18 +152,16 @@
     (is (= nil (state/get-editor-action))
         "Don't autocomplete properties if typing in a block where properties already exist"))
 
-  (testing "Kura task shortcut expansion"
+  (testing "Kura stays selectable as a slash command"
     (let [saved (atom nil)]
       (with-redefs [state/get-edit-input-id (constantly "edit-input")
                     state/set-block-content-and-last-pos! (fn [id content pos]
                                                             (reset! saved {:id id :content content :pos pos}))
                     cursor/move-cursor-to (constantly nil)]
+        (state/set-editor-action! :commands)
         (handle-last-input-handler {:value "/kura"})
-        (is (= {:id "edit-input"
-                :content "LATER #kuratask\n\t-"
-                :pos (count "LATER #kuratask\n\t-")}
-               @saved)
-            "Typing /kura expands directly into the kura task template"))))
+        (is (nil? @saved)
+            "Typing /kura should not auto-expand before the user chooses the slash command"))))
 
   (testing "Command autocompletion"
     (handle-last-input-handler {:value "/"})
