@@ -8,5 +8,5 @@
                        (filter #(= "kura" (first %)))
                        first)]
       (is (= "kura" (first command)))
-      (is (= [[:editor/input "LATER #kuratask\n\t-" {:last-pattern "/"}]]
+      (is (= [[:editor/input "LATER #kuratask" {:last-pattern "/"}]]
              (second command))))))

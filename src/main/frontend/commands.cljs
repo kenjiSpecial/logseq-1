@@ -86,7 +86,7 @@
    [:editor/set-marker marker]
    [:editor/move-cursor-to-end]])
 
-(def kura-task-template "LATER #kuratask\n\t-")
+(def kura-task-template "LATER #kuratask")
 
 (defn ->priority
   [priority]
