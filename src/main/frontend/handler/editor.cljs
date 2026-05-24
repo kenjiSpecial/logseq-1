@@ -1908,6 +1908,31 @@
   [input pos]
   (contains? #{" " "\t"} (get (.-value input) (- pos 2))))
 
+(defn- kura-task-shortcut-prefix?
+  [prefix]
+  (let [shortcut "/kura"
+        before-shortcut-pos (- (count prefix) (count shortcut))]
+    (and (string/ends-with? prefix shortcut)
+         (or (zero? before-shortcut-pos)
+             (contains? #{\space \tab \newline}
+                        (get prefix (dec before-shortcut-pos)))))))
+
+(defn- expand-kura-task-shortcut!
+  [input pos]
+  (let [value (.-value input)
+        shortcut "/kura"
+        prefix (subs value 0 pos)]
+    (when (kura-task-shortcut-prefix? prefix)
+      (let [new-prefix (str (subs prefix 0 (- (count prefix) (count shortcut)))
+                            commands/kura-task-template)
+            new-value (str new-prefix (subs value pos))
+            new-pos (count new-prefix)]
+        (when-let [input-id (state/get-edit-input-id)]
+          (state/set-block-content-and-last-pos! input-id new-value new-pos)
+          (cursor/move-cursor-to input new-pos)
+          (state/clear-editor-action!)
+          true)))))
+
 (defn handle-last-input []
   (let [input           (state/get-input)
         pos             (cursor/pos input)
@@ -1918,6 +1943,9 @@
     ;; TODO: is it cross-browser compatible?
     ;; (not= (gobj/get native-e "inputType") "insertFromPaste")
     (cond
+      (expand-kura-task-shortcut! input pos)
+      nil
+
       (and (= last-input-char (state/get-editor-command-trigger))
            (or (re-find #"(?m)^/" (str (.-value input))) (start-of-new-word? input pos)))
       (do
