@@ -21,6 +21,19 @@
   (is (= "/api/graph/file?path=pages%2F%E4%BB%8A%E6%97%A5.md"
          (server-graph/api-url "/api/graph/file" "pages/今日.md"))))
 
+(deftest write-content-classification
+  (testing "text writes are mirrored into DB file content"
+    (is (true? (server-graph/db-text-write-content? "page text"))))
+  (testing "binary asset writes are not mirrored into DB file content"
+    (is (false? (server-graph/db-text-write-content?
+                 #js {:getReader (fn [] nil)}))))
+  (testing "binary-like bodies are sent as asset writes"
+    (is (true? (server-graph/binary-write-content?
+                #js {:getReader (fn [] nil)})))
+    (when (exists? js/Blob)
+      (is (true? (server-graph/binary-write-content?
+                  (js/Blob. #js ["png"] #js {:type "image/png"})))))))
+
 (deftest manifest-entry-snapshot-keeps-watchable-text-files
   (is (= {:path "pages/today.md"
           :etag "\"abc\""

@@ -99,6 +99,36 @@
   (and content
        (fn? (.-getReader content))))
 
+(defn- blob-like?
+  [content]
+  (and content
+       (exists? js/Blob)
+       (instance? js/Blob content)))
+
+(defn- array-buffer-like?
+  [content]
+  (and content
+       (exists? js/ArrayBuffer)
+       (instance? js/ArrayBuffer content)))
+
+(defn- array-buffer-view-like?
+  [content]
+  (and content
+       (exists? js/ArrayBuffer)
+       (fn? (.-isView js/ArrayBuffer))
+       (.isView js/ArrayBuffer content)))
+
+(defn binary-write-content?
+  [content]
+  (or (readable-stream-like? content)
+      (blob-like? content)
+      (array-buffer-like? content)
+      (array-buffer-view-like? content)))
+
+(defn db-text-write-content?
+  [content]
+  (string? content))
+
 (def asset-content-types
   {"avif" "image/avif"
    "bmp" "image/bmp"
@@ -124,8 +154,10 @@
 (defn- write-request-opts
   [rpath content]
   (let [stream? (readable-stream-like? content)
-        content-type (if stream?
-                       (asset-content-type rpath)
+        binary? (binary-write-content? content)
+        content-type (if binary?
+                       (or (asset-content-type rpath)
+                           "application/octet-stream")
                        "text/plain; charset=utf-8")
         opts #js {:method "PUT"
                   :body content}]
@@ -356,7 +388,8 @@
       (p/let [opts (write-request-opts normalized content)
               result (fetch-json (api-url "/api/graph/file" normalized) opts)
               stat (:stat result)]
-        (db/set-file-content! repo normalized content)
+        (when (db-text-write-content? content)
+          (db/set-file-content! repo normalized content))
         (db/set-file-last-modified-at! repo normalized (stat->mtime stat))
         stat)))
 
