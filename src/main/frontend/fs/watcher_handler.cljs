@@ -6,6 +6,7 @@
             [frontend.db :as db]
             [frontend.db.model :as model]
             [frontend.fs :as fs]
+            [frontend.fs.server-graph :as server-graph]
             [logseq.common.path :as path]
             [frontend.handler.editor :as editor]
             [frontend.handler.file :as file-handler]
@@ -139,9 +140,11 @@
       (p/let [[files deleted-files]
               (-> (fs/readdir repo-dir :path-only? true)
                   (p/chain (fn [files]
-                             (->> files
-                                  (map #(path/relative-path repo-dir %))
-                                  (remove #(fs-util/ignored-path? repo-dir %))))
+                             (if (server-graph/server-graph-dir? repo-dir)
+                               (remove #(fs-util/ignored-path? repo-dir %) files)
+                               (->> files
+                                    (map #(path/relative-path repo-dir %))
+                                    (remove #(fs-util/ignored-path? repo-dir %)))))
                            (fn [files]
                              (let [deleted-files (set/difference (set db-files) (set files))]
                                [files deleted-files])))

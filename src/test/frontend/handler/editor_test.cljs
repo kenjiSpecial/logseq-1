@@ -152,6 +152,17 @@
     (is (= nil (state/get-editor-action))
         "Don't autocomplete properties if typing in a block where properties already exist"))
 
+  (testing "Kura stays selectable as a slash command"
+    (let [saved (atom nil)]
+      (with-redefs [state/get-edit-input-id (constantly "edit-input")
+                    state/set-block-content-and-last-pos! (fn [id content pos]
+                                                            (reset! saved {:id id :content content :pos pos}))
+                    cursor/move-cursor-to (constantly nil)]
+        (state/set-editor-action! :commands)
+        (handle-last-input-handler {:value "/kura"})
+        (is (nil? @saved)
+            "Typing /kura should not auto-expand before the user chooses the slash command"))))
+
   (testing "Command autocompletion"
     (handle-last-input-handler {:value "/"})
     (is (= :commands (state/get-editor-action))

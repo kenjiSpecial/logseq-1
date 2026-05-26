@@ -3,6 +3,7 @@
             [frontend.components.svg :as svg]
             [frontend.date :as date]
             [frontend.handler.editor :as editor-handler]
+            [frontend.mobile.calendar :as mobile-calendar]
             [frontend.mobile.record :as record]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
@@ -55,12 +56,14 @@
              (state/sub :mobile/show-tabbar?)
              (state/get-current-repo))
     [:div.cp__footer.w-full.bottom-0.justify-between
+     (mobile-calendar/open-calendar-modal)
      (audio-record-cp)
      (mobile-bar-command
       #(do (when-not (mobile-util/native-ipad?)
              (state/set-left-sidebar-open! false))
            (state/pub-event! [:go/search]))
       "search")
+     (mobile-bar-command mobile-calendar/open-calendar! "calendar")
      (mobile-bar-command state/toggle-document-mode! "notes")
      (mobile-bar-command
       #(let [page (or (state/get-current-page)
