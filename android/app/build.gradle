@@ -1,14 +1,23 @@
 apply plugin: 'com.android.application'
 
+def journalAndroid = System.getenv('LOGSEQ_JOURNAL_ANDROID') == '1' || System.getenv('LOGSEQ_JOURNAL_ANDROID') == 'true'
+
 android {
     namespace "com.logseq.app"
     compileSdkVersion rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.logseq.app"
+        applicationId journalAndroid ? "dev.patopo.journal" : "com.logseq.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 92
+        versionCode journalAndroid ? 100 : 92
         versionName "1.0.0"
+        // The Journal API intentionally uses the private Tailnet HTTP endpoint;
+        // keep cleartext access opt-in so the regular OG build remains false.
+        manifestPlaceholders = [journalUsesCleartext: journalAndroid ? "true" : "false"]
+        resValue "string", "app_name", journalAndroid ? "Journal" : "Logseq OG"
+        resValue "string", "title_activity_main", journalAndroid ? "Journal" : "Logseq OG"
+        resValue "string", "package_name", journalAndroid ? "dev.patopo.journal" : "com.logseq.app"
+        resValue "string", "custom_url_scheme", journalAndroid ? "dev.patopo.journal" : "com.logseq.app"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

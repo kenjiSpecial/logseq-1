@@ -7,7 +7,10 @@
             [frontend.date :as date]
             [frontend.db :as db]
             [frontend.fs :as fs]
+            [frontend.fs.server-graph :as server-graph]
             [frontend.fs.nfs :as nfs]
+            [frontend.journal-mobile.config :as journal-mobile-config]
+            [frontend.journal-mobile.local-graph :as journal-local-graph]
             [frontend.handler.file :as file-handler]
             [frontend.handler.repo-config :as repo-config-handler]
             [frontend.handler.common.file :as file-common-handler]
@@ -104,7 +107,9 @@
           page-exists? (db/entity repo-url [:block/name (util/page-name-sanity-lc title)])
           empty-blocks? (db/page-empty? repo-url (util/page-name-sanity-lc title))]
       (when (or empty-blocks? (not page-exists?))
-        (p/let [_ (nfs/check-directory-permission! repo-url)
+        (p/let [_ (when-not (or (server-graph/enabled?)
+                                (journal-mobile-config/enabled?))
+                    (nfs/check-directory-permission! repo-url))
                 _ (fs/mkdir-if-not-exists (path/path-join repo-dir (config/get-journals-directory)))
                 file-exists? (fs/file-exists? repo-dir file-rpath)]
           (when-not file-exists?
@@ -470,7 +475,12 @@
 
 (defn get-repos
   []
-  (p/let [nfs-dbs (db-persist/get-all-graphs)
+  (if (server-graph/enabled?)
+    (p/resolved [(server-graph/repo-entry)])
+    (if (journal-mobile-config/enabled?)
+      (p/let [_ (journal-local-graph/ensure!)]
+        [(journal-local-graph/repo-entry)])
+      (p/let [nfs-dbs (db-persist/get-all-graphs)
           nfs-dbs (map (fn [db]
                          {:url db
                           :root (config/get-local-dir db)
@@ -491,7 +501,7 @@
 
       :else
       [{:url config/local-repo
-        :example? true}])))
+        :example? true}])))))
 
 (defn combine-local-&-remote-graphs
   [local-repos remote-repos]

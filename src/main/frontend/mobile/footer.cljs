@@ -3,6 +3,9 @@
             [frontend.components.svg :as svg]
             [frontend.date :as date]
             [frontend.handler.editor :as editor-handler]
+            [frontend.journal-mobile.config :as journal-config]
+            [frontend.journal-mobile.status :as journal-status]
+            [frontend.journal-mobile.sync :as journal-sync]
             [frontend.mobile.record :as record]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
@@ -46,7 +49,34 @@
                          "player-stop")
      [:div.timer.ml-2
       {:on-click record/stop-recording}
-      (seconds->minutes:seconds (/ (- (js/Date.now) @*record-start) 1000))]]))
+     (seconds->minutes:seconds (/ (- (js/Date.now) @*record-start) 1000))]]))
+
+(rum/defc journal-sync-status < rum/reactive
+  []
+  (when (journal-config/enabled?)
+    (let [{:keys [phase last-error last-diff conflicts queued-count]} @journal-sync/state
+          online? (state/sub :network/online?)
+          phase-label (journal-status/phase-label phase online?)
+          changed-count (or (:changedCount last-diff) 0)
+          remote-only-count (or (:remoteOnlyCount last-diff) 0)
+          queue-count (or queued-count 0)]
+      [:div.flex.items-center.justify-between.px-3.py-1.text-xs.bg-base-2
+       {:role "status"
+        :aria-live "polite"}
+       [:span
+        (str "Journal: " phase-label
+             (when (pos? queue-count) (str " · queue " queue-count))
+             (when (pos? changed-count) (str " · pull " changed-count))
+             (when (pos? remote-only-count) (str " · new " remote-only-count))
+             (when (seq conflicts) (str " · conflicts " (count conflicts))))]
+       [:span.flex.items-center.gap-2
+        (when last-error
+          [:span.text-red-500 {:title last-error} "needs attention"])
+        (when (or (not online?) (= phase :error) (= phase :conflict))
+          [:button.text-xs
+           {:on-click #(journal-sync/sync-now!)
+            :type "button"}
+           "Retry"])]])))
 
 (rum/defc footer < rum/reactive
   []
@@ -54,20 +84,22 @@
              (not (state/sub :editor/editing?))
              (state/sub :mobile/show-tabbar?)
              (state/get-current-repo))
-    [:div.cp__footer.w-full.bottom-0.justify-between
-     (audio-record-cp)
-     (mobile-bar-command
-      #(do (when-not (mobile-util/native-ipad?)
-             (state/set-left-sidebar-open! false))
-           (state/pub-event! [:go/search]))
-      "search")
-     (mobile-bar-command state/toggle-document-mode! "notes")
-     (mobile-bar-command
-      #(let [page (or (state/get-current-page)
-                      (string/lower-case (date/journal-name)))]
-         (editor-handler/api-insert-new-block!
-          ""
-          {:page page
-           :edit-block? true
-           :replace-empty-target? true}))
-      "edit")]))
+    [:div.w-full
+     (journal-sync-status)
+     [:div.cp__footer.w-full.bottom-0.justify-between
+      (audio-record-cp)
+      (mobile-bar-command
+       #(do (when-not (mobile-util/native-ipad?)
+              (state/set-left-sidebar-open! false))
+            (state/pub-event! [:go/search]))
+       "search")
+      (mobile-bar-command state/toggle-document-mode! "notes")
+      (mobile-bar-command
+       #(let [page (or (state/get-current-page)
+                       (string/lower-case (date/journal-name)))]
+          (editor-handler/api-insert-new-block!
+           ""
+           {:page page
+            :edit-block? true
+            :replace-empty-target? true}))
+       "edit")]]))

@@ -18,6 +18,8 @@
             [frontend.db.react :as react]
             [frontend.error :as error]
             [frontend.extensions.srs :as srs]
+            [frontend.fs :as fs]
+            [frontend.fs.server-graph :as server-graph]
             [frontend.handler.command-palette :as command-palette]
             [frontend.handler.events :as events]
             [frontend.handler.file :as file-handler]
@@ -30,6 +32,8 @@
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
             [frontend.idb :as idb]
+            [frontend.journal-mobile.local-graph :as journal-local-graph]
+            [frontend.journal-mobile.sync :as journal-sync]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
             [frontend.modules.outliner.datascript :as outliner-db]
@@ -41,6 +45,7 @@
             [frontend.util.persist-var :as persist-var]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
+            [logseq.graph-parser.util :as gp-util]
             [promesa.core :as p]
             [frontend.mobile.core :as mobile]))
 
@@ -71,6 +76,53 @@
     (f)
     (js/setInterval f 5000)))
 
+(defn- server-graph-file->db-file
+  [{:keys [path content size mtime]}]
+  {:file/path (gp-util/path-normalize path)
+   :file/content content
+   :file/size size
+   :file/last-modified-at mtime})
+
+(defn- load-server-graph!
+  [repo]
+  (when (and (server-graph/enabled?)
+             (= repo server-graph/default-repo))
+    (p/let [repo-dir (config/get-repo-dir repo)
+            result (fs/get-files repo-dir)
+            file-objs (mapv server-graph-file->db-file (:files result))]
+      (repo-handler/start-repo-db-if-not-exists! repo)
+      (repo-handler/load-new-repo-to-db!
+       repo
+       {:new-graph? true
+        :empty-graph? (empty? file-objs)
+       :file-objs file-objs}))))
+
+(defn- load-journal-local-graph!
+  [repo]
+  (when (and (journal-local-graph/enabled?)
+             (= repo (journal-local-graph/graph-repo)))
+    (journal-sync/register-after-pull!
+     (fn [{:keys [downloaded]}]
+       (when (and (pos? downloaded)
+                  (= (state/get-current-repo) repo))
+         (p/let [file-objs (journal-local-graph/files)]
+           ;; Remote downloads are applied to the local graph only after the
+           ;; conditional pull has completed. Dirty queue paths are protected
+           ;; by sync, so an in-flight Android edit is never replaced here.
+           (repo-handler/load-new-repo-to-db!
+            repo
+            {:new-graph? false
+             :empty-graph? false
+             :file-objs file-objs})))))
+    (p/let [file-objs (journal-local-graph/files)]
+      (repo-handler/start-repo-db-if-not-exists! repo)
+      (repo-handler/load-new-repo-to-db!
+       repo
+       {:new-graph? true
+        :empty-graph? (empty? file-objs)
+        :file-objs file-objs})
+      (journal-sync/start!))))
+
 (defn- instrument!
   []
   (let [total (srs/get-srs-cards-total)]
@@ -78,7 +130,14 @@
 
 (defn restore-and-setup!
   [repos]
-  (when-let [repo (or (state/get-current-repo) (:url (first repos)))]
+  (when-let [repo (if (server-graph/enabled?)
+                    server-graph/default-repo
+                    (if (journal-local-graph/enabled?)
+                      (journal-local-graph/graph-repo)
+                      (or (state/get-current-repo) (:url (first repos)))))]
+    (when (or (server-graph/enabled?)
+              (journal-local-graph/enabled?))
+      (state/set-current-repo! repo))
     (-> (db/restore! repo)
         (p/then
          (fn []
@@ -86,7 +145,9 @@
            (ui-handler/add-style-if-exists!)
 
            (->
-            (p/do! (repo-config-handler/start {:repo repo})
+            (p/do! (load-server-graph! repo)
+                   (load-journal-local-graph! repo)
+                   (repo-config-handler/start {:repo repo})
                    (when (config/global-config-enabled?)
                      (global-config-handler/start {:repo repo}))
                    (when (config/plugin-config-enabled?)
@@ -97,7 +158,9 @@
                 (shortcut/refresh!)
 
                 (cond
-                  (and (not (seq (db/get-files config/local-repo)))
+                  (and (not (server-graph/enabled?))
+                       (not (journal-local-graph/enabled?))
+                       (not (seq (db/get-files config/local-repo)))
                        ;; Not native local directory
                        (not (some config/local-db? (map :url repos)))
                        (not (mobile-util/native-platform?)))
@@ -110,7 +173,9 @@
          (fn []
            (js/console.log "db restored, setting up repo hooks")
 
-           (state/pub-event! [:modal/nfs-ask-permission])
+           (when-not (or (server-graph/enabled?)
+                         (journal-local-graph/enabled?))
+             (state/pub-event! [:modal/nfs-ask-permission]))
 
            (page-handler/init-commands!)
 
@@ -161,9 +226,14 @@
 ;; FIXME: Another get-repos implementation at src\main\frontend\handler\repo.cljs
 (defn- get-repos
   []
-  (p/let [nfs-dbs (db-persist/get-all-graphs)]
-    ;; TODO: Better IndexDB migration handling
-    (cond
+  (if (server-graph/enabled?)
+    (p/resolved [(server-graph/repo-entry)])
+    (if (journal-local-graph/enabled?)
+      (p/let [_ (journal-local-graph/ensure!)]
+        [(journal-local-graph/repo-entry)])
+      (p/let [nfs-dbs (db-persist/get-all-graphs)]
+      ;; TODO: Better IndexDB migration handling
+      (cond
       (and (mobile-util/native-platform?)
            (some #(or (string/includes? % " ")
                       (string/includes? % "logseq_local_/")) nfs-dbs))
@@ -181,7 +251,7 @@
 
       :else
       [{:url config/local-repo
-        :example? true}])))
+        :example? true}])))))
 
 (defn- register-components-fns!
   []
