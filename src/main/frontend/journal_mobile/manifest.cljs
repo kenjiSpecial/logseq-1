@@ -3,6 +3,7 @@
   (:require ["@capacitor/filesystem" :refer [Directory Encoding Filesystem]]
             [cljs-bean.core :as bean]
             [clojure.set :as set]
+            [clojure.string :as string]
             [frontend.journal-mobile.config :as journal-config]
             [frontend.journal-mobile.dirty-queue :as dirty-queue]
             [logseq.graph-parser.util :as gp-util]
@@ -25,8 +26,21 @@
                    :directory filesystem-directory}
                   opts)))
 
+(defn- mkdir!
+  [opts]
+  (.mkdir Filesystem opts))
+
+(defn- write-file!
+  [opts]
+  (.writeFile Filesystem opts))
+
 (defn- ensure-sync-dir! []
-  (.mkdir Filesystem (filesystem-opts (dirty-queue/sync-dir) {:recursive true})))
+  (p/catch
+   (mkdir! (filesystem-opts (dirty-queue/sync-dir) {:recursive true}))
+   (fn [error]
+     (if (string/includes? (str error) "Directory exists")
+       nil
+       (p/rejected error)))))
 
 (defn- file-exists?
   [fpath]
@@ -59,10 +73,10 @@
     (p/catch
      (p/let [_ (ensure-sync-dir!)
              data (js/JSON.stringify (clj->js manifest))]
-       (.writeFile Filesystem (filesystem-opts (manifest-path)
-                                               {:data data
-                                                :encoding (.-UTF8 Encoding)
-                                                :recursive true})))
+       (write-file! (filesystem-opts (manifest-path)
+                                     {:data data
+                                      :encoding (.-UTF8 Encoding)
+                                      :recursive true})))
      (fn [error]
        (log/error :journal-mobile/manifest-save-failed error)
        nil))))
