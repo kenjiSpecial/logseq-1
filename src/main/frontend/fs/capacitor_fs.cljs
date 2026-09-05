@@ -1,12 +1,16 @@
 (ns frontend.fs.capacitor-fs
   "Implementation of fs protocol for mobile"
-  (:require ["@capacitor/filesystem" :refer [Encoding Filesystem]]
+  (:require ["@capacitor/filesystem" :refer [Directory Encoding Filesystem]]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
             [goog.string :as gstring]
             [frontend.config :as config]
             [frontend.db :as db]
             [frontend.fs.protocol :as protocol]
+            [frontend.journal-mobile.config :as journal-config]
+            [frontend.journal-mobile.dirty-queue :as dirty-queue]
+            [frontend.journal-mobile.manifest :as journal-manifest]
+            [frontend.journal-mobile.sync :as journal-sync]
             [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
             [frontend.util :as util]
@@ -30,10 +34,110 @@
         (p/do!
          (.requestPermissions Filesystem))))))
 
+(def ^:private journal-filesystem-directory
+  (.-Data Directory))
+
+(defn- unsafe-journal-path?
+  [raw]
+  (let [segments (some-> raw (string/split #"/"))]
+    (or (string/blank? raw)
+        (string/starts-with? raw "/")
+        (boolean (re-find #"^[A-Za-z]:" raw))
+        (string/starts-with? (string/lower-case raw) "file://")
+        (string/includes? raw "\\")
+        (some #{".."} segments))))
+
+(defn- validate-journal-data-path!
+  [label fpath]
+  (let [raw (when (string? fpath) (string/trim fpath))]
+    (when (unsafe-journal-path? raw)
+      (throw (js/Error. (str "Invalid Journal " label " path: " (pr-str raw)))))
+    (path/path-normalize raw)))
+
+(defn- under-journal-root?
+  [root fpath]
+  (or (= fpath root)
+      (string/starts-with? fpath (str root "/"))))
+
+(defn- journal-data-path
+  [fpath]
+  (when (journal-config/enabled?)
+    (let [raw (when (string? fpath) (string/trim fpath))]
+      (when (unsafe-journal-path? raw)
+        (throw (js/Error. (str "Invalid Journal filesystem path: " (pr-str raw)))))
+      (let [root (validate-journal-data-path! "local graph dir" (journal-config/local-graph-dir))
+            normalized (path/path-normalize raw)]
+        (when-not (under-journal-root? root normalized)
+          (throw (js/Error. (str "Journal filesystem path escapes local graph root: " (pr-str raw)))))
+        normalized))))
+
+(defn- filesystem-opts
+  [fpath opts]
+  (clj->js (if-let [journal-path (journal-data-path fpath)]
+             (merge {:path journal-path
+                     :directory journal-filesystem-directory}
+                    opts)
+             (merge {:path fpath}
+                    opts))))
+
+(defn- filesystem-transfer-opts
+  [from to]
+  (let [journal-from (journal-data-path from)
+        journal-to (journal-data-path to)]
+    (clj->js (cond-> {:from (or journal-from from)
+                      :to (or journal-to to)}
+               journal-from (assoc :directory journal-filesystem-directory)
+               journal-to (assoc :toDirectory journal-filesystem-directory)))))
+
+(defn- journal-readdir-files
+  [dir files]
+  (if (journal-data-path dir)
+    (mapv (fn [{:keys [name] :as file}]
+            (assoc file :uri (path/path-join dir name)))
+          files)
+    files))
+
+(defn- journal-relative-path
+  [dir rpath raw-rpath]
+  (when (journal-config/enabled?)
+    (let [raw-dir (some-> dir string/trim)
+          raw-rpath (some-> (or raw-rpath rpath) string/trim)]
+      (when-not (or (unsafe-journal-path? raw-dir)
+                    (unsafe-journal-path? raw-rpath))
+        (let [root (validate-journal-data-path! "local graph dir" (journal-config/local-graph-dir))
+              dir (path/path-normalize raw-dir)
+              rpath (path/path-normalize raw-rpath)
+              fpath (when (and dir rpath) (path/path-join dir rpath))]
+          (cond
+            (and dir (= dir root) rpath)
+            rpath
+
+            (and fpath (under-journal-root? root fpath))
+            (subs fpath (inc (count root)))
+
+            :else
+            nil))))))
+
+(defn- enqueue-journal-put!
+  [dir rpath raw-rpath]
+  (try
+    (if-let [rpath (journal-relative-path dir rpath raw-rpath)]
+      (p/catch
+       (p/let [base-remote-etag (journal-manifest/remote-etag rpath)
+               _ (dirty-queue/enqueue-put! rpath {:baseRemoteEtag base-remote-etag})
+               _ (journal-sync/schedule!)]
+         nil)
+       (fn [error]
+         (log/error :journal-mobile/dirty-queue-enqueue-failed error)
+         (p/rejected error)))
+      (p/resolved nil))
+    (catch :default error
+      (log/error :journal-mobile/dirty-queue-enqueue-failed error)
+      (p/rejected error))))
+
 (defn- <dir-exists?
   [fpath]
-  (p/catch (p/let [fpath (path/path-normalize fpath)
-                   stat (.stat Filesystem (clj->js {:path fpath}))]
+  (p/catch (p/let [stat (.stat Filesystem (filesystem-opts fpath nil))]
              (-> stat
                  bean/->clj
                  :type
@@ -45,9 +149,9 @@
   "Write a binary file, requires base64 encoding"
   [path content]
   (when-not (string/blank? path)
-    (-> (p/chain (.writeFile Filesystem (clj->js {:path path
-                                                  :data content
-                                                  :recursive true}))
+    (-> (p/chain (.writeFile Filesystem (filesystem-opts path
+                                                         {:data content
+                                                          :recursive true}))
                  #(js->clj % :keywordize-keys true))
         (p/catch (fn [error]
                    (js/console.error "writeFile Error: " path ": " error)
@@ -56,10 +160,10 @@
 (defn- <write-file-with-utf8
   [path content]
   (when-not (string/blank? path)
-    (-> (p/chain (.writeFile Filesystem (clj->js {:path path
-                                                  :data content
-                                                  :encoding (.-UTF8 Encoding)
-                                                  :recursive true}))
+    (-> (p/chain (.writeFile Filesystem (filesystem-opts path
+                                                         {:data content
+                                                          :encoding (.-UTF8 Encoding)
+                                                          :recursive true}))
                  #(js->clj % :keywordize-keys true))
         (p/catch (fn [error]
                    (js/console.error "writeFile Error: " path ": " error)
@@ -68,8 +172,8 @@
 (defn- <read-file-with-utf8
   [path]
   (when-not (string/blank? path)
-    (-> (p/chain (.readFile Filesystem (clj->js {:path path
-                                                 :encoding (.-UTF8 Encoding)}))
+    (-> (p/chain (.readFile Filesystem (filesystem-opts path
+                                                        {:encoding (.-UTF8 Encoding)}))
                  #(js->clj % :keywordize-keys true)
                  #(get % :data nil))
         (p/catch (fn [error]
@@ -77,9 +181,10 @@
                    nil)))))
 
 (defn- <readdir [path]
-  (-> (p/chain (.readdir Filesystem (clj->js {:path path}))
+  (-> (p/chain (.readdir Filesystem (filesystem-opts path nil))
                #(js->clj % :keywordize-keys true)
-               :files)
+               :files
+               #(journal-readdir-files path %))
       (p/catch (fn [error]
                  (js/console.error "readdir Error: " path ": " error)
                  nil))))
@@ -165,13 +270,13 @@
 (defn- <truncate-old-versioned-files!
   "reserve the latest 6 version files"
   [dir]
-  (-> (p/let [files (.readdir Filesystem (clj->js {:path dir}))
+  (-> (p/let [files (.readdir Filesystem (filesystem-opts dir nil))
 
               files (:files (js->clj files :keywordize-keys true))]
         (drop 6 (reverse (sort-by :mtime files))))
       (p/then (fn [old-version-files]
                 (p/all (mapv (fn [file]
-                               (.deleteFile Filesystem (clj->js {:path (:uri file)})))
+                               (.deleteFile Filesystem (filesystem-opts (:uri file) nil)))
                              old-version-files))))
       (p/catch (fn [_]))))
 
@@ -213,11 +318,18 @@
     (<truncate-old-versioned-files! file-root)))
 
 (defn- write-file-impl!
-  [repo dir rpath content {:keys [ok-handler error-handler old-content skip-compare?]} stat]
-  (let [fpath (path/path-join dir rpath)]
+  [repo dir rpath content {:keys [ok-handler error-handler old-content skip-compare? raw-rpath]} stat]
+  (let [raw-rpath (or raw-rpath rpath)
+        invalid-journal-rpath? (and (journal-config/enabled?)
+                                    (unsafe-journal-path? raw-rpath))
+        fpath (path/path-join dir rpath)]
+    (when invalid-journal-rpath?
+      (throw (js/Error. (str "Invalid Journal write path: " (pr-str raw-rpath)))))
     (if (or (string/blank? repo) skip-compare?)
       (p/catch
-       (p/let [result (<write-file-with-utf8 fpath content)]
+       (p/let [result (<write-file-with-utf8 fpath content)
+               _ (when result
+                   (enqueue-journal-put! dir rpath raw-rpath))]
          (when ok-handler
            (ok-handler repo fpath result)))
        (fn [error]
@@ -247,7 +359,9 @@
           (->
            (p/let [result (<write-file-with-utf8 fpath content)
                    mtime (-> (js->clj stat :keywordize-keys true)
-                             :mtime)]
+                             :mtime)
+                   _ (when result
+                       (enqueue-journal-put! dir rpath raw-rpath))]
              (when-not contents-matched?
                (backup-file repo-dir :backup-dir fpath disk-content))
              (db/set-file-last-modified-at! repo rpath mtime)
@@ -335,8 +449,7 @@
                   (if exists?
                     (p/resolved true)
                     (.mkdir Filesystem
-                            (clj->js
-                             {:path dir})))))
+                            (filesystem-opts dir nil)))))
         (p/catch (fn [error]
                    (log/error :mkdir! {:path dir
                                        :error error})))))
@@ -346,15 +459,12 @@
                   (if exists?
                     (p/resolved true)
                     (.mkdir Filesystem
-                            (clj->js
-                             {:path dir
-                              :recursive true})))))
+                            (filesystem-opts dir {:recursive true})))))
         (p/catch (fn [error]
                    (log/error :mkdir-recur! {:path dir
                                              :error error})))))
   (readdir [_this dir]                  ; recursive
-    (let [dir (path/path-normalize dir)]
-      (get-file-paths dir)))
+    (get-file-paths dir))
   (unlink! [this repo fpath _opts]
     (p/let [repo-dir (config/get-local-dir repo)
             recycle-dir (path/path-join repo-dir config/app-name ".recycle") ;; logseq/.recycle
@@ -376,26 +486,22 @@
   (write-file! [_this repo dir path content opts]
     (let [fpath (path/path-join dir path)]
       (p/let [stat (p/catch
-                    (.stat Filesystem (clj->js {:path fpath}))
+                    (.stat Filesystem (filesystem-opts fpath nil))
                     (fn [_e] :not-found))]
         ;; `path` is full-path
         (write-file-impl! repo dir path content opts stat))))
   (rename! [_this _repo old-fpath new-fpath]
     (-> (.rename Filesystem
-                 (clj->js
-                  {:from old-fpath
-                   :to new-fpath}))
+                 (filesystem-transfer-opts old-fpath new-fpath))
         (p/catch (fn [error]
                    (log/error :rename-file-failed error)))))
   (copy! [_this _repo old-path new-path]
     (-> (.copy Filesystem
-               (clj->js
-                {:from old-path
-                 :to new-path}))
+               (filesystem-transfer-opts old-path new-path))
         (p/catch (fn [error]
                    (log/error :copy-file-failed error)))))
   (stat [_this fpath]
-    (-> (p/chain (.stat Filesystem (clj->js {:path fpath}))
+    (-> (p/chain (.stat Filesystem (filesystem-opts fpath nil))
                  #(js->clj % :keywordize-keys true))
         (p/catch (fn [error]
                    (let [errstr (if error (.toString error) "")]
@@ -409,8 +515,17 @@
   (get-files [_this dir]
     (get-files dir))
   (watch-dir! [_this dir _options]
-    (p/do!
-     (.unwatch mobile-util/fs-watcher)
-     (.watch mobile-util/fs-watcher (clj->js {:path dir}))))
-  (unwatch-dir! [_this _dir]
-    (.unwatch mobile-util/fs-watcher)))
+    (if (and (journal-config/enabled?)
+             (journal-data-path dir))
+      ;; Journal writes enqueue their own upload after the successful
+      ;; Capacitor write. The native watcher expects an absolute external
+      ;; directory and must not be pointed at the app-private relative path.
+      (p/resolved nil)
+      (p/do!
+       (.unwatch mobile-util/fs-watcher)
+       (.watch mobile-util/fs-watcher (clj->js {:path dir})))))
+  (unwatch-dir! [_this dir]
+    (if (and (journal-config/enabled?)
+             (journal-data-path dir))
+      (p/resolved nil)
+      (.unwatch mobile-util/fs-watcher))))
