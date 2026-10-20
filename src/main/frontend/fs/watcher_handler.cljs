@@ -6,6 +6,7 @@
             [frontend.db :as db]
             [frontend.db.model :as model]
             [frontend.fs :as fs]
+            [frontend.fs.server-graph :as server-graph]
             [logseq.common.path :as path]
             [frontend.handler.editor :as editor]
             [frontend.handler.file :as file-handler]
@@ -49,7 +50,7 @@
     (set-missing-block-ids! content)
     (db/set-file-last-modified-at! repo path mtime)))
 
-(defn handle-changed!
+(defn- handle-changed-aux!
   [type {:keys [dir path content stat global-dir] :as payload}]
   (when dir
     (let [;; Global directory events don't know their originating repo so we rely
@@ -124,54 +125,81 @@
 
           :else
           (log/error :fs/watcher-no-handler {:type type
-                                             :payload payload})))
+                                             :payload payload}))))))
 
-      ;; return nil, otherwise the entire db will be transferred by ipc
-      nil)))
+(defn- confirm-server-graph-content!
+  "Lets the server graph base its next conditional write on this remote
+   version, once the db really holds it (it is skipped e.g. for a journal
+   template)."
+  [type {:keys [dir path content stat]} result]
+  (when (and (server-graph/server-graph-dir? dir)
+             (contains? #{"add" "change"} type)
+             (string? content)
+             (:etag stat))
+    (let [repo (config/get-local-repo dir)]
+      (-> (p/let [_ result]
+            (when (= (string/trim content)
+                     (string/trim (or (db/get-file repo path) "")))
+              (server-graph/remote-content-applied! path (:etag stat))))
+          (p/catch (fn [error]
+                     (log/error :fs/server-graph-apply-failed {:path path
+                                                               :error error})))))))
+
+(defn handle-changed!
+  [type payload]
+  (let [result (handle-changed-aux! type payload)]
+    (confirm-server-graph-content! type payload result)
+    ;; return nil, otherwise the entire db will be transferred by ipc
+    nil))
 
 (defn load-graph-files!
   [graph]
   (when graph
-    (let [repo-dir (config/get-repo-dir graph)
-          db-files (->> (db/get-files graph)
-                        (map first))]
-      ;; read all files in the repo dir, notify if readdir error
-      (p/let [[files deleted-files]
-              (-> (fs/readdir repo-dir :path-only? true)
-                  (p/chain (fn [files]
-                             (->> files
-                                  (map #(path/relative-path repo-dir %))
-                                  (remove #(fs-util/ignored-path? repo-dir %))))
-                           (fn [files]
-                             (let [deleted-files (set/difference (set db-files) (set files))]
-                               [files deleted-files])))
-                  (p/catch (fn [error]
-                             (when-not (config/demo-graph? graph)
-                               (js/console.error "reading" graph)
-                               (state/pub-event! [:notification/show
-                                                  {:content (str "The graph " graph " can not be read:" error)
-                                                   :status :error
-                                                   :clear? false}]))
-                             [nil nil])))]
-        (prn ::init-watcher repo-dir {:deleted (count deleted-files)
-                                      :total (count files)})
-        (when (seq deleted-files)
-          (let [delete-tx-data (->> (db/delete-files deleted-files)
-                                    (concat (db/delete-blocks graph deleted-files nil))
-                                    (remove nil?))]
-            (db/transact! graph delete-tx-data {:delete-files? true})))
-        (doseq [file-rpath files]
-          (when-let [_ext (util/get-file-ext file-rpath)]
-            (->
-             (p/let [content (fs/read-file repo-dir file-rpath)
-                     stat (fs/stat repo-dir file-rpath)
-                     type (if (db/file-exists? graph file-rpath)
-                            "change"
-                            "add")]
-               (handle-changed! type
-                                {:dir repo-dir
-                                 :path file-rpath
-                                 :content content
-                                 :stat stat}))
-             (p/catch (fn [error]
-                        (js/console.dir error))))))))))
+    (let [repo-dir (config/get-repo-dir graph)]
+      ;; Server graph reloads the whole graph from the API on every startup and
+      ;; detects later changes through frontend.fs.server-graph's manifest polling,
+      ;; so this rescan is redundant. Worse, it races with that initial load and
+      ;; re-parses files that aren't in the db yet, duplicating every block.
+      (when-not (server-graph/server-graph-dir? repo-dir)
+        (let [db-files (->> (db/get-files graph)
+                            (map first))]
+          ;; read all files in the repo dir, notify if readdir error
+          (p/let [[files deleted-files]
+                  (-> (fs/readdir repo-dir :path-only? true)
+                      (p/chain (fn [files]
+                                 (->> files
+                                      (map #(path/relative-path repo-dir %))
+                                      (remove #(fs-util/ignored-path? repo-dir %))))
+                               (fn [files]
+                                 (let [deleted-files (set/difference (set db-files) (set files))]
+                                   [files deleted-files])))
+                      (p/catch (fn [error]
+                                 (when-not (config/demo-graph? graph)
+                                   (js/console.error "reading" graph)
+                                   (state/pub-event! [:notification/show
+                                                      {:content (str "The graph " graph " can not be read:" error)
+                                                       :status :error
+                                                       :clear? false}]))
+                                 [nil nil])))]
+            (prn ::init-watcher repo-dir {:deleted (count deleted-files)
+                                          :total (count files)})
+            (when (seq deleted-files)
+              (let [delete-tx-data (->> (db/delete-files deleted-files)
+                                        (concat (db/delete-blocks graph deleted-files nil))
+                                        (remove nil?))]
+                (db/transact! graph delete-tx-data {:delete-files? true})))
+            (doseq [file-rpath files]
+              (when-let [_ext (util/get-file-ext file-rpath)]
+                (->
+                 (p/let [content (fs/read-file repo-dir file-rpath)
+                         stat (fs/stat repo-dir file-rpath)
+                         type (if (db/file-exists? graph file-rpath)
+                                "change"
+                                "add")]
+                   (handle-changed! type
+                                    {:dir repo-dir
+                                     :path file-rpath
+                                     :content content
+                                     :stat stat}))
+                 (p/catch (fn [error]
+                            (js/console.dir error))))))))))))

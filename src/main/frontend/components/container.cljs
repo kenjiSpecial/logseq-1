@@ -392,7 +392,15 @@
            :title  (t :right-side-bar/all-pages)
            :href   (rfe/href :all-pages)
            :active (and (not srs-open?) (= route-name :all-pages))
-           :icon   "files"})]]
+           :icon   "files"})
+
+         [:div.hub-nav
+          [:a.item.group.flex.items-center.text-sm.font-medium.rounded-md
+           {:href "https://hub.pa-to-po.dev/"
+            :target "_blank"
+            :rel "noopener noreferrer"}
+           (ui/icon "apps")
+           [:span.flex-1 "Hub"]]]]]
 
        [:div.nav-contents-container.flex.flex-col.gap-1.pt-1
         {:on-scroll on-contents-scroll}

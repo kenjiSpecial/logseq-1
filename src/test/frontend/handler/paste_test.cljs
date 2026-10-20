@@ -174,6 +174,50 @@
              (is (= files (js->clj @pasted-file)))
              (reset)))))
 
+(deftest-async editor-on-paste-with-item-file-pasting
+  (let [file #js {:name "image.png" :type "image/png" :size 11836}
+        item #js {:type "image/png"
+                  :getAsFile (fn [] file)}
+        pasted-file (atom nil)
+        stopped? (atom false)]
+    (test-helper/with-reset
+      reset
+      [editor-handler/upload-asset (fn [_id files & _]
+                                     (reset! pasted-file files))
+       util/stop (fn [_e] (reset! stopped? true))
+       state/get-edit-block (constantly {})]
+      (p/let [_ ((paste-handler/editor-on-paste! :fake-id)
+                 #js {:clipboardData #js {:getData (constantly "")
+                                          :files #js []
+                                          :items #js [item]}})]
+        (is (identical? file (aget @pasted-file 0)))
+        (is @stopped?)
+        (reset)))))
+
+(deftest-async editor-on-paste-with-html-data-image-pasting
+  (let [data-url "data:image/png;base64,QQ=="
+        html (str "<img src=\"" data-url "\"/>")
+        pasted-file (atom nil)
+        stopped? (atom false)]
+    (test-helper/with-reset
+      reset
+      [editor-handler/upload-asset (fn [_id files & _]
+                                     (reset! pasted-file files))
+       util/stop (fn [_e] (reset! stopped? true))
+       state/get-edit-block (constantly {})]
+      (p/let [_ ((paste-handler/editor-on-paste! :fake-id)
+                 #js {:clipboardData #js {:getData (fn [kind]
+                                                     (if (= kind "text/html") html ""))
+                                          :files #js []}})]
+        (is (some? @pasted-file))
+        (when-let [files @pasted-file]
+          (let [file (aget files 0)]
+            (is (= "image.png" (.-name file)))
+            (is (= "image/png" (.-type file)))
+            (is (= 1 (.-size file)))))
+        (is @stopped?)
+        (reset)))))
+
 (deftest-async editor-on-paste-prefer-text-blocks-to-html
   (let [actual-blocks (atom nil)
         ;; Simplified version of block attributes that are copied

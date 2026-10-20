@@ -192,11 +192,51 @@
       (paste-text-in-one-block-at-point))
     (paste-copied-blocks-or-text text e html)))
 
+(defn- array-like->seq [xs]
+  (when xs
+    (if (seqable? xs)
+      (seq xs)
+      (keep #(or (aget xs %)
+                 (when-let [item (gobj/get xs "item")]
+                   (.call item xs %)))
+            (range (or (gobj/get xs "length") 0))))))
+
+(defn- get-file-from-items [clipboard-data]
+  (some (fn [item]
+          (when (and (string/starts-with? (or (gobj/get item "type") "") "image/")
+                     (gobj/get item "getAsFile"))
+            (.getAsFile item)))
+        (array-like->seq (gobj/get clipboard-data "items"))))
+
+(defn- get-data-image-url [html]
+  (when-not (string/blank? html)
+    (util/safe-re-find #"data:image/[^\"'\s<>)]+" html)))
+
+(defn- data-url->file [data-url]
+  (when-let [[_ mime base64? data] (util/safe-re-find #"^data:(image/[^;,]+)(;base64)?,(.*)$" data-url)]
+    (let [ext (second (string/split mime #"/" 2))
+          filename (str "image." (or ext "png"))
+          decoded (if base64?
+                    (js/atob data)
+                    (js/decodeURIComponent data))
+          bytes (js/Uint8Array. (count decoded))]
+      (dotimes [idx (count decoded)]
+        (aset bytes idx (.charCodeAt decoded idx)))
+      (if (exists? js/File)
+        (js/File. #js[bytes] filename #js {:type mime})
+        (doto (js/Blob. #js[bytes] #js {:type mime})
+          (gobj/set "name" filename))))))
+
+(defn- get-file-from-clipboard [clipboard-data html]
+  (or (first (array-like->seq (gobj/get clipboard-data "files")))
+      (get-file-from-items clipboard-data)
+      (some-> html get-data-image-url data-url->file)))
+
 (defn- paste-file-if-exists [id e]
   (when id
     (let [clipboard-data (gobj/get e "clipboardData")
-          files (.-files clipboard-data)]
-      (when-let [file (first files)]
+          html (.getData clipboard-data "text/html")]
+      (when-let [file (get-file-from-clipboard clipboard-data html)]
         (when-let [block (state/get-edit-block)]
           (editor-handler/upload-asset id #js[file] (:block/format block)
                                        editor-handler/*asset-uploading? true)))
@@ -217,11 +257,15 @@
     (state/set-state! :editor/on-paste? true)
     (let [clipboard-data (gobj/get e "clipboardData")
           html (.getData clipboard-data "text/html")
-          text (.getData clipboard-data "text")]
+          text (.getData clipboard-data "text")
+          clipboard-item-file? (get-file-from-items clipboard-data)
+          html-data-image? (get-data-image-url html)]
       (cond
         (and (string/blank? text) (string/blank? html))
         (paste-file-if-exists id e)
-        (and (seq (.-files clipboard-data)) (state/preferred-pasting-file?))
+        (or clipboard-item-file? html-data-image?)
+        (paste-file-if-exists id e)
+        (and (seq (array-like->seq (gobj/get clipboard-data "files"))) (state/preferred-pasting-file?))
         (paste-file-if-exists id e)
         :else
         (let [text' (or (when (gp-util/url? text)

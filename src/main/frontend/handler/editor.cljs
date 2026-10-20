@@ -15,6 +15,7 @@
             [frontend.format.mldoc :as mldoc]
             [frontend.fs :as fs]
             [frontend.fs.nfs :as nfs]
+            [frontend.fs.server-graph :as server-graph]
             [logseq.common.path :as path]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.block :as block-handler]
@@ -1512,6 +1513,11 @@
 
         (mobile-util/native-platform?)
         (mobile-util/convert-file-src full-path)
+
+        (server-graph/server-graph-dir? repo-dir)
+        ;; absolute, so image-handler/render-local-images! leaves it alone instead
+        ;; of re-reading the image through the text-only graph file API
+        (str (.-origin js/location) (server-graph/asset-url path))
 
         :else ;; nfs
         (let [handle-path (str "handle/" full-path)

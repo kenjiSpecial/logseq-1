@@ -86,11 +86,17 @@
    [:editor/set-marker marker]
    [:editor/move-cursor-to-end]])
 
+(def kura-task-template "LATER #kuratask")
+
 (defn ->priority
   [priority]
   [[:editor/clear-current-slash]
    [:editor/set-priority priority]
    [:editor/move-cursor-to-end]])
+
+(defn ->kura-task
+  []
+  [[:editor/input kura-task-template {:last-pattern (state/get-editor-command-trigger)}]])
 
 (defn ->inline
   [type]
@@ -249,6 +255,9 @@
      ["Today" #(get-page-ref-text (date/today)) "Insert the date of today"]
      ["Current time" #(date/get-current-time) "Insert current time"]
      ["Date picker" [[:editor/show-date-picker]] "Pick a date and insert here"]]
+
+    ;; task management
+    [["kura" (->kura-task) "Insert kura task template"]]
 
     ;; task management
     (get-preferred-workflow)

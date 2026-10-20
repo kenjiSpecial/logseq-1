@@ -1,9 +1,11 @@
 apply plugin: 'com.android.application'
 
+def journalAndroid = System.getenv('LOGSEQ_JOURNAL_ANDROID') == '1' || System.getenv('LOGSEQ_JOURNAL_ANDROID') == 'true'
+
 android {
     compileSdkVersion rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.logseq.app"
+        applicationId journalAndroid ? "dev.patopo.journal" : "com.logseq.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 56

@@ -5,6 +5,7 @@
             [frontend.config :as config]
             [frontend.fs.nfs :as nfs]
             [frontend.fs.node :as node]
+            [frontend.fs.server-graph :as server-graph]
             [frontend.fs.capacitor-fs :as capacitor-fs]
             [frontend.fs.memory-fs :as memory-fs]
             [frontend.mobile.util :as mobile-util]
@@ -19,6 +20,7 @@
             [electron.ipc :as ipc]))
 
 (defonce nfs-backend (nfs/->Nfs))
+(defonce server-graph-backend (server-graph/->ServerGraphFs))
 (defonce memory-backend (memory-fs/->MemoryFs))
 (defonce node-backend (node/->Node))
 (defonce mobile-backend (capacitor-fs/->Capacitorfs))
@@ -44,6 +46,9 @@
     (cond
       (nil? dir) ;; global file op, use native backend
       (get-native-backend)
+
+      (server-graph/server-graph-dir? dir)
+      server-graph-backend
 
       (string/starts-with? dir "memory://")
       memory-backend
@@ -92,10 +97,12 @@
 (defn write-file!
   [repo dir rpath content opts]
   (when content
-    (let [path (gp-util/path-normalize rpath)
+    (let [raw-rpath rpath
+          path (gp-util/path-normalize rpath)
           fs-record (get-fs dir)]
       (->
        (p/let [opts (assoc opts
+                           :raw-rpath raw-rpath
                            :error-handler
                            (fn [error]
                              (state/pub-event! [:capture-error {:error error
@@ -156,33 +163,42 @@
   ([fpath]
    (protocol/stat (get-fs fpath) fpath))
   ([dir path]
-   (let [fpath (path/path-join dir path)]
+   (let [fpath (if (server-graph/server-graph-dir? dir)
+                 path
+                 (path/path-join dir path))]
      (protocol/stat (get-fs dir) fpath))))
 
 (defn open-dir
   [dir]
-  (let [record (get-native-backend)]
+  (let [record (if (server-graph/server-graph-dir? dir)
+                 (get-fs dir)
+                 (get-native-backend))]
     (p/let [result (protocol/open-dir record dir)]
       (when result
-        (let [{:keys [path files]} result
-              dir path
-              files (mapv (fn [entry]
-                            (assoc entry :path (path/relative-path dir (:path entry))))
-                          files)]
-          {:path path :files files})))))
+        (if (server-graph/server-graph-dir? dir)
+          result
+          (let [{:keys [path files]} result
+                dir path
+                files (mapv (fn [entry]
+                              (assoc entry :path (path/relative-path dir (:path entry))))
+                            files)]
+            {:path path :files files}))))))
 
 (defn get-files
   "List all files in the directory, recursively.
    
    Wrap as {:path string :files []}, using relative path"
   [dir]
-  (let [fs-record (get-native-backend)]
-    (p/let [files (protocol/get-files fs-record dir)]
+  (let [fs-record (get-fs dir)]
+    (p/let [result (protocol/get-files fs-record dir)
+            files (if (map? result) (:files result) result)]
       (println ::get-files (count files) "files")
-      (let [files (mapv (fn [entry]
-                          (assoc entry :path (path/relative-path dir (:path entry))))
-                        files)]
-        {:path dir :files files}))))
+      (if (server-graph/server-graph-dir? dir)
+        {:path dir :files (vec files)}
+        (let [files (mapv (fn [entry]
+                            (assoc entry :path (path/relative-path dir (:path entry))))
+                          files)]
+          {:path dir :files files})))))
 
 (defn watch-dir!
   ([dir] (watch-dir! dir {}))
