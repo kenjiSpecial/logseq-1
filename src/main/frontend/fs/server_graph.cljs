@@ -3,7 +3,14 @@
 
    This backend keeps the normal Logseq auto-save pipeline intact: editor changes
    still call frontend.fs/write-file!, and this implementation persists those
-   writes immediately to /api/graph/file on the server."
+   writes immediately to /api/graph/file on the server.
+
+   Writes are conditional. The backend remembers the ETag of the version each
+   file was loaded from (or last written as) and sends it as If-Match, or
+   If-None-Match: * for a file it has never seen. When another client changed
+   the file first, the server answers 412 and keeps its content; this tab then
+   saves its own version under logseq/bak, loads the newer remote content and
+   tells the user, instead of overwriting the other client's edits."
   (:require [clojure.set :as set]
             [clojure.string :as string]
             [frontend.db :as db]
@@ -22,6 +29,18 @@
 (goog-define ENABLED "false")
 
 (defonce *watchers (atom {}))
+
+;; rpath -> ETag (unquoted, e.g. "sha256:...") of the content the db is based
+;; on. Only updated once that content is known to be in the db: initial load,
+;; our own successful writes, and remote changes the watcher has applied.
+(defonce *etags (atom {}))
+;; rpath -> ETag of the remote content last handed to the file watcher, so a
+;; poll does not fetch the same version again while it is being applied.
+(defonce *published-etags (atom {}))
+;; rpath -> promise of the last queued write, so writes to one file go out one
+;; at a time and each uses the ETag returned by the previous one.
+(defonce *write-queues (atom {}))
+(defonce *visibility-listener (atom nil))
 
 (defn server-graph-dir?
   [dir]
@@ -74,6 +93,53 @@
   (p/let [body (.json response)]
     (js->clj body :keywordize-keys true)))
 
+(defn unquote-etag
+  "Normalizes an ETag header or manifest value to its bare form (sha256:...)."
+  [value]
+  (when (string? value)
+    (let [value (string/trim value)
+          value (if (string/starts-with? value "W/") (subs value 2) value)
+          quoted? (and (>= (count value) 2)
+                       (string/starts-with? value "\"")
+                       (string/ends-with? value "\""))
+          value (if quoted?
+                  (string/replace (subs value 1 (dec (count value))) "\\\"" "\"")
+                  value)]
+      (when-not (string/blank? value)
+        value))))
+
+(defn quote-etag
+  [etag]
+  (str "\"" (string/replace etag "\"" "\\\"") "\""))
+
+(defn write-precondition-headers
+  "If-Match for a file this tab has loaded, If-None-Match: * for a new one."
+  [etag]
+  (if etag
+    {"if-match" (quote-etag etag)}
+    {"if-none-match" "*"}))
+
+(defn- response-etag
+  [response stat]
+  (or (unquote-etag (.get (.-headers response) "etag"))
+      (unquote-etag (:etag stat))))
+
+(defn remember-etag!
+  [rpath etag]
+  (when-let [etag (unquote-etag etag)]
+    (swap! *etags assoc rpath etag)))
+
+(defn- forget-etag!
+  [rpath]
+  (swap! *etags dissoc rpath)
+  (swap! *published-etags dissoc rpath))
+
+(defn remote-content-applied!
+  "Called by the file watcher once remote content fetched by the poller is in
+   the db, so the next write is based on that version."
+  [rpath etag]
+  (remember-etag! rpath etag))
+
 (defn- assert-ok!
   [response]
   (if (.-ok response)
@@ -90,9 +156,19 @@
 
 (defn- fetch-text
   [url]
-  (p/let [response (js/fetch url)
+  (p/let [response (js/fetch url #js {:cache "no-store"})
           response (assert-ok! response)]
     (.text response)))
+
+(defn- fetch-file
+  "Reads a graph file with its ETag. Resolves to nil when it does not exist."
+  [rpath]
+  (p/let [response (js/fetch (api-url "/api/graph/file" rpath) #js {:cache "no-store"})]
+    (when-not (= 404 (.-status response))
+      (p/let [response (assert-ok! response)
+              content (.text response)]
+        {:content content
+         :etag (response-etag response nil)}))))
 
 (defn- readable-stream-like?
   [content]
@@ -152,7 +228,7 @@
       blob)))
 
 (defn- write-request-opts
-  [rpath content]
+  [rpath content headers]
   (let [stream? (readable-stream-like? content)
         binary? (binary-write-content? content)
         content-type (if binary?
@@ -165,9 +241,13 @@
                    (readable-stream->blob content content-type)
                    content)]
       (set! (.-body opts) body)
-      (when content-type
-        (set! (.-headers opts) #js {"content-type" content-type}))
+      (set! (.-headers opts) (clj->js (assoc headers "content-type" content-type)))
       opts)))
+
+(defn- put-file!
+  [rpath content headers]
+  (p/let [opts (write-request-opts rpath content headers)]
+    (js/fetch (api-url "/api/graph/file" rpath) opts)))
 
 (def allowed-file-exts #{"md" "markdown" "org" "excalidraw" "edn" "css" "js"})
 (def ignored-path-prefixes #{"." ".recycle" "node_modules" "logseq/bak"
@@ -205,7 +285,7 @@
                   (update :type #(or % "file")))]
     (when (allowed-file? entry)
       {:path (:path entry)
-       :etag etag
+       :etag (unquote-etag etag)
        :size size
        :mtime (stat->mtime entry)
        :type (:type entry)})))
@@ -237,14 +317,73 @@
                    (map previous)
                    sorted-entries)}))
 
+(defn manifest-refresh-diff
+  "The part of a manifest change this tab still has to fetch.
+
+   Entries whose ETag the tab already has (its own writes) or has already
+   handed to the watcher are skipped. Files whose ETag differs from the version
+   the db was loaded from count as changed even without a previous snapshot,
+   so the first poll after startup catches edits made during the initial load."
+  [previous current known-etags published-etags]
+  (let [{:keys [added changed deleted]} (if previous
+                                          (diff-manifest-snapshots previous current)
+                                          {:added [] :changed [] :deleted []})
+        known? (fn [{:keys [path etag]}]
+                 (or (= etag (get known-etags path))
+                     (= etag (get published-etags path))))
+        stale (keep (fn [[rpath entry]]
+                      (when-let [known (get known-etags rpath)]
+                        (when (not= known (:etag entry))
+                          entry)))
+                    current)
+        added-paths (set (map :path added))
+        changed (->> (concat changed stale)
+                     (remove #(contains? added-paths (:path %)))
+                     (map (juxt :path identity))
+                     (into {})
+                     vals)]
+    {:added (->> added (remove known?) (sort-by :path) vec)
+     :changed (->> changed (remove known?) (sort-by :path) vec)
+     :deleted deleted}))
+
+(defn conflict-backup-path
+  "Where a write rejected with 412 keeps this tab's version, next to Logseq's
+   own backups: logseq/bak/journals/2026_10_20/2026-10-20T08_53_44.000Z.Web.md"
+  [rpath ^js date]
+  (let [ext (util/get-file-ext rpath)
+        stem (if (string/blank? ext)
+               rpath
+               (subs rpath 0 (- (count rpath) (count ext) 1)))
+        stamp (string/replace (.toISOString date) ":" "_")]
+    (str "logseq/bak/" stem "/" stamp ".Web" (when-not (string/blank? ext) (str "." ext)))))
+
+(defn same-text-content?
+  [a b]
+  (= (string/trim (or a "")) (string/trim (or b ""))))
+
+(defn trivial-content?
+  "Content not worth keeping as a conflict backup, e.g. a fresh journal page."
+  [content]
+  (contains? #{"" "-" "*"} (string/trim (or content ""))))
+
+(defn replaceable-remote-content?
+  "Remote content another client created without writing anything into it,
+   e.g. today's journal page. The file watcher does not load such content, so
+   it is overwritten instead of being reported as a conflict on every save."
+  [content journal-template]
+  (or (trivial-content? content)
+      (and (not (string/blank? journal-template))
+           (same-text-content? content journal-template))))
+
 (defn- file-entry->db-file
-  [{:keys [path size mtime type content] :as entry}]
+  [{:keys [path size type content etag] :as entry}]
   {:name (last (string/split path #"/"))
    :path path
    :mtime (stat->mtime entry)
    :size size
    :type type
-   :content content})
+   :content content
+   :etag etag})
 
 (defn- list-entries
   [rpath]
@@ -253,8 +392,21 @@
 
 (defn- read-entry-content
   [entry]
-  (p/let [content (fetch-text (api-url "/api/graph/file" (:path entry)))]
-    (assoc entry :content content)))
+  (p/let [response (js/fetch (api-url "/api/graph/file" (:path entry)) #js {:cache "no-store"})
+          response (assert-ok! response)
+          content (.text response)]
+    (assoc entry
+           :content content
+           :etag (response-etag response nil))))
+
+(defn- reset-etags!
+  "The graph was (re)loaded into the db from these files."
+  [files]
+  (reset! *published-etags {})
+  (reset! *etags (into {}
+                       (keep (fn [{:keys [path etag]}]
+                               (when etag [path etag])))
+                       files)))
 
 (defn- walk-files
   [rpath]
@@ -278,11 +430,12 @@
   (str (or dir default-dir) "/" rpath))
 
 (defn- snapshot->stat
-  [{:keys [path size mtime type]}]
+  [{:keys [path size mtime type etag]}]
   {:path path
    :size size
    :mtime mtime
-   :type type})
+   :type type
+   :etag etag})
 
 (defn- publish-watch-event!
   [dir event snapshot content]
@@ -295,23 +448,61 @@
       :content content
       :stat (snapshot->stat snapshot)})]))
 
+(defn- publish-remote-content!
+  "Hands fetched remote content to the file watcher, which loads it into the
+   db and then reports back through remote-content-applied!."
+  [dir event snapshot {:keys [content etag]}]
+  (swap! *published-etags assoc (:path snapshot) etag)
+  (publish-watch-event! dir event (assoc snapshot :etag etag) content))
+
 (defn- fetch-manifest
-  []
-  (fetch-json "/api/graph/manifest" nil))
+  "Resolves to nil when the manifest has not changed since manifest-etag."
+  [manifest-etag]
+  (p/let [response (js/fetch "/api/graph/manifest"
+                             #js {:cache "no-store"
+                                  :headers (clj->js (if manifest-etag
+                                                      {"if-none-match" (quote-etag manifest-etag)}
+                                                      {}))})]
+    (when-not (= 304 (.-status response))
+      (p/let [response (assert-ok! response)
+              manifest (response-json response)]
+        {:manifest manifest
+         :etag (or (response-etag response nil)
+                   (unquote-etag (:revision manifest)))}))))
 
 (defn- publish-add-or-change!
+  "Resolves to the path when it could not be fetched, nil otherwise."
   [dir event snapshot]
-  (p/let [content (fetch-text (api-url "/api/graph/file" (:path snapshot)))]
-    (publish-watch-event! dir event snapshot content)))
+  (-> (p/let [remote (fetch-file (:path snapshot))]
+        (when (and remote
+                   (not= (:etag remote) (get @*etags (:path snapshot))))
+          (publish-remote-content! dir event snapshot remote))
+        nil)
+      (p/catch (fn [error]
+                 (js/console.error "Server Graph watcher fetch failed" (:path snapshot) error)
+                 (:path snapshot)))))
 
 (defn- publish-diff!
+  "Resolves to the paths that failed to fetch."
   [dir {:keys [added changed deleted]}]
   (doseq [snapshot deleted]
     (publish-watch-event! dir "unlink" snapshot nil))
-  (p/all
-   (concat
-    (map #(publish-add-or-change! dir "add" %) added)
-    (map #(publish-add-or-change! dir "change" %) changed))))
+  (p/let [results (p/all
+                   (concat
+                    (map #(publish-add-or-change! dir "add" %) added)
+                    (map #(publish-add-or-change! dir "change" %) changed)))]
+    (set (remove nil? results))))
+
+(defn- retry-failed-paths
+  "Keeps the previous snapshot entry for paths that failed to fetch so the next
+   poll sees them as added or changed again."
+  [snapshot previous failed-paths]
+  (reduce (fn [snapshot rpath]
+            (if-let [entry (get previous rpath)]
+              (assoc snapshot rpath entry)
+              (dissoc snapshot rpath)))
+          snapshot
+          failed-paths))
 
 (defn- update-watcher!
   [dir f]
@@ -325,17 +516,45 @@
     (when (and watcher (not (:polling? watcher)))
       (update-watcher! dir #(assoc % :polling? true))
       (->
-       (p/let [manifest (fetch-manifest)
-               snapshot (manifest->snapshot manifest)
-               previous (:snapshot (get @*watchers dir))
-               _ (when previous
-                   (publish-diff! dir (diff-manifest-snapshots previous snapshot)))]
-         (update-watcher! dir #(assoc % :snapshot snapshot
-                                      :polling? false)))
+       (p/let [result (fetch-manifest (:manifest-etag watcher))]
+         (if-not result
+           (update-watcher! dir #(assoc % :polling? false))
+           (p/let [snapshot (manifest->snapshot (:manifest result))
+                   previous (:snapshot (get @*watchers dir))
+                   failed (publish-diff! dir (manifest-refresh-diff previous snapshot
+                                                                    @*etags @*published-etags))]
+             (update-watcher! dir #(assoc % :snapshot (retry-failed-paths snapshot previous failed)
+                                          ;; refetch the whole manifest until every change got through
+                                          :manifest-etag (when (empty? failed) (:etag result))
+                                          :polling? false)))))
        (p/catch
         (fn [error]
           (js/console.error "Server Graph watcher poll failed" error)
           (update-watcher! dir #(assoc % :polling? false))))))))
+
+(defn- poll-all-watch-dirs!
+  []
+  (when-not (.-hidden js/document)
+    (doseq [dir (keys @*watchers)]
+      (poll-watch-dir! dir))))
+
+(defn- listen-visibility!
+  "Background tabs get their timers throttled, so check for remote changes as
+   soon as a stale tab is looked at again, before the user starts typing."
+  []
+  (when (and (nil? @*visibility-listener)
+             (exists? js/document))
+    (let [listener (fn [_] (poll-all-watch-dirs!))]
+      (.addEventListener js/document "visibilitychange" listener)
+      (.addEventListener js/window "focus" listener)
+      (reset! *visibility-listener listener))))
+
+(defn- unlisten-visibility!
+  []
+  (when-let [listener @*visibility-listener]
+    (.removeEventListener js/document "visibilitychange" listener)
+    (.removeEventListener js/window "focus" listener)
+    (reset! *visibility-listener nil)))
 
 (defn- start-watch-dir!
   [dir]
@@ -352,7 +571,108 @@
   (let [dir (or dir default-dir)]
     (when-let [interval-id (get-in @*watchers [dir :interval-id])]
       (js/clearInterval interval-id))
-    (swap! *watchers dissoc dir)))
+    (swap! *watchers dissoc dir)
+    (when (empty? @*watchers)
+      (unlisten-visibility!))))
+
+(defn- enqueue-write!
+  [rpath f]
+  (let [previous (get @*write-queues rpath (p/resolved nil))
+        result (p/handle previous (fn [_ _] (f)))]
+    (swap! *write-queues assoc rpath result)
+    (p/handle result (fn [_ _]
+                       (swap! *write-queues (fn [queues]
+                                              (if (identical? result (get queues rpath))
+                                                (dissoc queues rpath)
+                                                queues)))))
+    result))
+
+(defn conflict-message
+  [rpath backup-path remote-exists?]
+  (str "「" rpath "」はほかの端末で"
+       (if remote-exists? "更新" "削除")
+       "されていたため、このタブの内容で上書きしませんでした。"
+       (when remote-exists? "最新の内容を読み込み直します。")
+       (when backup-path
+         (str "このタブでの編集は「" backup-path "」に保存しました。"))))
+
+(defn- notify!
+  [content status]
+  (state/pub-event! [:notification/show {:content content
+                                         :status status
+                                         :clear? false}]))
+
+(defn- save-conflict-backup!
+  "Resolves to the backup path, or nil when it could not be written."
+  [rpath content]
+  (let [backup-path (conflict-backup-path rpath (js/Date.))]
+    (-> (p/let [response (put-file! backup-path content (write-precondition-headers nil))
+                _ (assert-ok! response)]
+          backup-path)
+        (p/catch (fn [error]
+                   (js/console.error "Server Graph conflict backup failed" backup-path error)
+                   nil)))))
+
+(declare write-file-conditionally!)
+
+(defn- handle-text-write-conflict!
+  "The server kept a newer version of rpath. Keep this tab's version under
+   logseq/bak before the newer remote content replaces it in the db."
+  [repo rpath content retry?]
+  (p/let [remote (fetch-file rpath)]
+    (cond
+      (and remote (same-text-content? (:content remote) content))
+      ;; The other client saved the same text; nothing to keep apart.
+      (do
+        (remember-etag! rpath (:etag remote))
+        (db/set-file-content! repo rpath content)
+        nil)
+
+      (and remote retry?
+           (replaceable-remote-content? (:content remote) (state/get-default-journal-template)))
+      (do
+        (remember-etag! rpath (:etag remote))
+        (write-file-conditionally! repo rpath content false))
+
+      :else
+      (p/let [backup-path (when-not (trivial-content? content)
+                            (save-conflict-backup! rpath content))]
+        (if (and (nil? backup-path) (not (trivial-content? content)))
+          ;; Without a backup, loading the remote version would drop this tab's
+          ;; edits. Keep them in the db; the next save hits 412 and tries again.
+          (notify! (str "「" rpath "」はほかの端末で更新されていますが、このタブの編集をバックアップできなかったため読み込み直しを保留しました。"
+                        "ページを再読み込みする前に編集内容を控えてください。")
+                   :error)
+          (do
+            (if remote
+              (publish-remote-content! default-dir "change"
+                                       {:path rpath :type "file" :mtime (js/Date.now)}
+                                       remote)
+              (forget-etag! rpath))
+            (notify! (conflict-message rpath backup-path (some? remote)) :warning)))
+        nil))))
+
+(defn- write-file-conditionally!
+  [repo rpath content retry?]
+  (p/let [response (put-file! rpath content (write-precondition-headers (get @*etags rpath)))]
+    (cond
+      (not= 412 (.-status response))
+      (p/let [response (assert-ok! response)
+              result (response-json response)
+              stat (:stat result)]
+        (remember-etag! rpath (response-etag response stat))
+        (when (db-text-write-content? content)
+          (db/set-file-content! repo rpath content))
+        (db/set-file-last-modified-at! repo rpath (stat->mtime stat))
+        stat)
+
+      (db-text-write-content? content)
+      (handle-text-write-conflict! repo rpath content retry?)
+
+      :else
+      (do
+        (notify! (str "「" rpath "」はすでにサーバーにあるため上書きしませんでした。") :warning)
+        nil))))
 
 (defrecord ServerGraphFs []
   protocol/Fs
@@ -373,8 +693,9 @@
   (unlink! [_this _repo fpath _opts]
     (let [rpath (normalize-path default-dir fpath)]
       (p/let [response (js/fetch (api-url "/api/graph/file" rpath)
-                                 #js {:method "DELETE"})]
-        (assert-ok! response)
+                                 #js {:method "DELETE"})
+              _ (assert-ok! response)]
+        (forget-etag! rpath)
         nil)))
 
   (rmdir! [_this _dir]
@@ -385,13 +706,7 @@
 
   (write-file! [_this repo dir rpath content _opts]
     (let [normalized (normalize-path dir rpath)]
-      (p/let [opts (write-request-opts normalized content)
-              result (fetch-json (api-url "/api/graph/file" normalized) opts)
-              stat (:stat result)]
-        (when (db-text-write-content? content)
-          (db/set-file-content! repo normalized content))
-        (db/set-file-last-modified-at! repo normalized (stat->mtime stat))
-        stat)))
+      (enqueue-write! normalized #(write-file-conditionally! repo normalized content true))))
 
   (rename! [this repo old-path new-path]
     (let [old-rpath (normalize-path default-dir old-path)
@@ -419,15 +734,18 @@
 
   (open-dir [_this dir]
     (p/let [files (walk-files "")]
+      (reset-etags! files)
       {:path (or dir default-dir)
        :files files}))
 
   (get-files [_this _dir]
     (p/let [files (walk-files "")]
+      (reset-etags! files)
       {:path default-dir
        :files files}))
 
   (watch-dir! [_this dir _options]
+    (listen-visibility!)
     (start-watch-dir! dir))
 
   (unwatch-dir! [_this dir]
