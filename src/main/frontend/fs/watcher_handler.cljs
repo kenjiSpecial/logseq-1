@@ -50,7 +50,7 @@
     (set-missing-block-ids! content)
     (db/set-file-last-modified-at! repo path mtime)))
 
-(defn handle-changed!
+(defn- handle-changed-aux!
   [type {:keys [dir path content stat global-dir] :as payload}]
   (when dir
     (let [;; Global directory events don't know their originating repo so we rely
@@ -125,10 +125,32 @@
 
           :else
           (log/error :fs/watcher-no-handler {:type type
-                                             :payload payload})))
+                                             :payload payload}))))))
 
-      ;; return nil, otherwise the entire db will be transferred by ipc
-      nil)))
+(defn- confirm-server-graph-content!
+  "Lets the server graph base its next conditional write on this remote
+   version, once the db really holds it (it is skipped e.g. for a journal
+   template)."
+  [type {:keys [dir path content stat]} result]
+  (when (and (server-graph/server-graph-dir? dir)
+             (contains? #{"add" "change"} type)
+             (string? content)
+             (:etag stat))
+    (let [repo (config/get-local-repo dir)]
+      (-> (p/let [_ result]
+            (when (= (string/trim content)
+                     (string/trim (or (db/get-file repo path) "")))
+              (server-graph/remote-content-applied! path (:etag stat))))
+          (p/catch (fn [error]
+                     (log/error :fs/server-graph-apply-failed {:path path
+                                                               :error error})))))))
+
+(defn handle-changed!
+  [type payload]
+  (let [result (handle-changed-aux! type payload)]
+    (confirm-server-graph-content! type payload result)
+    ;; return nil, otherwise the entire db will be transferred by ipc
+    nil))
 
 (defn load-graph-files!
   [graph]
