@@ -1515,7 +1515,9 @@
         (mobile-util/convert-file-src full-path)
 
         (server-graph/server-graph-dir? repo-dir)
-        (server-graph/asset-url path)
+        ;; absolute, so image-handler/render-local-images! leaves it alone instead
+        ;; of re-reading the image through the text-only graph file API
+        (str (.-origin js/location) (server-graph/asset-url path))
 
         :else ;; nfs
         (let [handle-path (str "handle/" full-path)
