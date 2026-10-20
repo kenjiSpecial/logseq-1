@@ -35,6 +35,7 @@
             [frontend.format.block :as block]
             [frontend.format.mldoc :as mldoc]
             [frontend.fs :as fs]
+            [frontend.fs.server-graph :as server-graph]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.block :as block-handler]
             [frontend.handler.common :as common-handler]
@@ -376,7 +377,8 @@
   (let [src (::src state)
         granted? (state/sub [:nfs/user-granted? (state/get-current-repo)])
         href (config/get-local-asset-absolute-path href)]
-    (when (or granted? (util/electron?) (mobile-util/native-platform?))
+    (when (or granted? (util/electron?) (mobile-util/native-platform?)
+              (server-graph/server-graph-dir? (config/get-repo-dir (state/get-current-repo))))
       (p/then (editor-handler/make-asset-url href) #(reset! src %)))
 
     (when @src
