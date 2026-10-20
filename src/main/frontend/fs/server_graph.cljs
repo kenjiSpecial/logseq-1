@@ -80,6 +80,18 @@
                      :else raw)]
     (gp-util/path-normalize normalized)))
 
+(defn asset-url
+  "URL the hosted server serves a graph asset from. Assets are not loaded with
+   the graph; the browser fetches them from /assets/* when they are shown.
+   ./assets/a b.png -> /assets/a%20b.png"
+  [path]
+  (let [rpath (normalize-path default-dir (string/replace (or path "") #"^\.{0,2}/" ""))]
+    ;; a URL, not a file system path
+    (str "/" (->> (string/split rpath #"/")
+                  (map js/encodeURIComponent)
+                  #_{:clj-kondo/ignore [:path-invalid-construct/string-join]}
+                  (string/join "/")))))
+
 (defn api-url
   ([endpoint rpath]
    (if (string/blank? rpath)
@@ -169,6 +181,28 @@
               content (.text response)]
         {:content content
          :etag (response-etag response nil)}))))
+
+(def fetch-concurrency
+  "How many graph requests run at once. Fetching a graph of a few thousand files
+   all at once makes the browser fail them with ERR_INSUFFICIENT_RESOURCES."
+  16)
+
+(defn map-limited
+  "Like (p/all (map f coll)), but with at most limit calls of f pending at a
+   time. Resolves to the results in the order of coll."
+  [limit f coll]
+  (let [items (vec coll)
+        results (atom (vec (repeat (count items) nil)))
+        cursor (atom -1)
+        run-next (fn run-next []
+                   (let [i (swap! cursor inc)]
+                     (if (< i (count items))
+                       (p/let [result (f (nth items i))]
+                         (swap! results assoc i result)
+                         (run-next))
+                       (p/resolved nil))))]
+    (p/let [_ (p/all (vec (repeatedly (min limit (count items)) run-next)))]
+      @results)))
 
 (defn- readable-stream-like?
   [content]
@@ -408,22 +442,21 @@
                                (when etag [path etag])))
                        files)))
 
-(defn- walk-files
+(defn- list-files
+  "Every loadable file under rpath, without content."
   [rpath]
   (p/let [entries (list-entries rpath)
-          children (p/all
-                    (map (fn [entry]
-                           (if (ignored-path? (:path entry))
-                             []
-                             (case (:type entry)
-                               "directory" (walk-files (:path entry))
-                               "file" (if (allowed-file? entry)
-                                        (p/let [entry (read-entry-content entry)]
-                                          [(file-entry->db-file entry)])
-                                        [])
-                               [])))
-                         entries))]
-    (vec (mapcat identity children))))
+          dirs (filter #(and (= "directory" (:type %))
+                             (not (ignored-path? (:path %))))
+                       entries)
+          nested (map-limited fetch-concurrency (comp list-files :path) dirs)]
+    (into (vec (filter allowed-file? entries)) cat nested)))
+
+(defn- walk-files
+  [rpath]
+  (p/let [entries (list-files rpath)
+          entries (map-limited fetch-concurrency read-entry-content entries)]
+    (mapv file-entry->db-file entries)))
 
 (defn- watch-event-path
   [dir rpath]
@@ -487,10 +520,11 @@
   [dir {:keys [added changed deleted]}]
   (doseq [snapshot deleted]
     (publish-watch-event! dir "unlink" snapshot nil))
-  (p/let [results (p/all
-                   (concat
-                    (map #(publish-add-or-change! dir "add" %) added)
-                    (map #(publish-add-or-change! dir "change" %) changed)))]
+  (p/let [results (map-limited fetch-concurrency
+                               (fn [[event snapshot]]
+                                 (publish-add-or-change! dir event snapshot))
+                               (concat (map (fn [snapshot] ["add" snapshot]) added)
+                                       (map (fn [snapshot] ["change" snapshot]) changed)))]
     (set (remove nil? results))))
 
 (defn- retry-failed-paths

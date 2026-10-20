@@ -26,6 +26,14 @@
   (is (= "/api/graph/file?path=pages%2F%E4%BB%8A%E6%97%A5.md"
          (server-graph/api-url "/api/graph/file" "pages/今日.md"))))
 
+(deftest asset-url-points-at-the-hosted-assets-route
+  (is (= "/assets/image_1792487185724_0.png"
+         (server-graph/asset-url "./assets/image_1792487185724_0.png")))
+  (is (= "/assets/image_1792487185724_0.png"
+         (server-graph/asset-url "../assets/image_1792487185724_0.png")))
+  (is (= "/assets/%E7%94%BB%E5%83%8F%201.png"
+         (server-graph/asset-url "/assets/画像 1.png"))))
+
 (deftest write-content-classification
   (testing "text writes are mirrored into DB file content"
     (is (true? (server-graph/db-text-write-content? "page text"))))
@@ -354,3 +362,72 @@
               (is (empty? @events))
               (is (= "sha256:mine" (get @server-graph/*etags "journals/2026_10_21.md"))))))
         (p/handle (fn [_ _] (done))))))
+
+(deftest map-limited-caps-pending-requests-and-keeps-order
+  (async done
+    (let [pending (atom 0)
+          max-pending (atom 0)
+          f (fn [n]
+              (swap! pending inc)
+              (swap! max-pending max @pending)
+              (js/Promise.
+               (fn [resolve _]
+                 (js/setTimeout (fn []
+                                  (swap! pending dec)
+                                  (resolve (* n 10)))
+                                (rand-int 5)))))]
+      (-> (p/let [results (server-graph/map-limited 4 f (range 50))
+                  empty-results (server-graph/map-limited 4 f [])]
+            (is (= (mapv #(* % 10) (range 50)) results))
+            (is (= 4 @max-pending))
+            (is (= [] empty-results)))
+          (p/handle (fn [_ error]
+                      (is (nil? error))
+                      (done)))))))
+
+
+(deftest get-files-walks-directories-with-a-bounded-number-of-requests
+  (async done
+    (let [pending (atom 0)
+          max-pending (atom 0)
+          listing {"" [{:path "journals" :type "directory"}
+                       {:path "assets" :type "directory"}
+                       {:path "logseq" :type "directory"}]
+                   "journals" (vec (for [i (range 60)]
+                                     {:path (str "journals/2026_01_" i ".md") :type "file" :size 3}))
+                   "assets" [{:path "assets/image.png" :type "file"}]
+                   "logseq" [{:path "logseq/config.edn" :type "file"}
+                             {:path "logseq/bak" :type "directory"}]}
+          query-path (fn [url]
+                       (some-> (second (re-find #"path=([^&]*)" url)) js/decodeURIComponent))
+          handler (fn [{:keys [url]}]
+                    (swap! pending inc)
+                    (swap! max-pending max @pending)
+                    (js/Promise.
+                     (fn [resolve _]
+                       (js/setTimeout
+                        (fn []
+                          (swap! pending dec)
+                          (resolve
+                           (if (string/includes? url "/api/graph/files")
+                             (response 200 (js/JSON.stringify
+                                            (clj->js {:entries (get listing (or (query-path url) "") [])}))
+                                       {})
+                             (response 200 (str "- " (query-path url))
+                                       {"etag" (server-graph/quote-etag (str "sha256:" (query-path url)))}))))
+                        1))))]
+      (-> (with-server!
+            handler
+            (fn [{:keys [requests]}]
+              (p/let [{:keys [files]} (protocol/get-files (server-graph/->ServerGraphFs) dir)]
+                (is (= 61 (count files)))
+                (is (= (str "- " "logseq/config.edn")
+                       (:content (first (filter #(= "logseq/config.edn" (:path %)) files)))))
+                (testing "assets and logseq/bak are listed but not read"
+                  (is (not-any? #(re-find #"(assets|logseq%2Fbak)" (:url %))
+                                (filter #(string/includes? (:url %) "/api/graph/file?") @requests)))
+                  (is (not-any? #(string/includes? (:url %) "logseq%2Fbak") @requests)))
+                (is (<= @max-pending server-graph/fetch-concurrency))
+                (is (= "sha256:journals/2026_01_7.md"
+                       (get @server-graph/*etags "journals/2026_01_7.md"))))))
+          (p/handle (fn [_ _] (done)))))))
