@@ -431,3 +431,91 @@
                 (is (= "sha256:journals/2026_01_7.md"
                        (get @server-graph/*etags "journals/2026_01_7.md"))))))
           (p/handle (fn [_ _] (done)))))))
+
+;; cached boot: reconcile a restored db with the server manifest
+
+(def hello-etag "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03")
+
+(deftest content-etag-matches-the-server-etag
+  (async done
+    (-> (p/let [[etag size] (server-graph/content->etag "hello\n")
+                [multibyte-etag multibyte-size] (server-graph/content->etag "今日")]
+          (is (= hello-etag etag))
+          (is (= 6 size))
+          (is (= 6 multibyte-size))
+          (is (string/starts-with? multibyte-etag "sha256:")))
+        (p/handle (fn [_ error]
+                    (when error (is (nil? error) (str error)))
+                    (done))))))
+
+(deftest db-files-become-a-snapshot-of-watchable-files
+  (async done
+    (-> (p/let [snapshot (server-graph/db-files->snapshot
+                          [{:file/path "pages/a.md" :file/content "hello\n" :file/last-modified-at 5}
+                           {:file/path "logseq/config.edn" :file/content "{}"}
+                           {:file/path "assets/image.png" :file/content "x"}
+                           {:file/path "pages/no-content.md"}])]
+          (is (= #{"pages/a.md" "logseq/config.edn"} (set (keys snapshot))))
+          (is (= {:path "pages/a.md" :etag hello-etag :size 6 :mtime 5 :type "file"}
+                 (get snapshot "pages/a.md"))))
+        (p/handle (fn [_ error]
+                    (when error (is (nil? error) (str error)))
+                    (done))))))
+
+(deftest seeded-snapshot-and-manifest-yield-added-changed-and-deleted
+  (async done
+    (-> (p/let [_ (server-graph/seed-from-db-files!
+                   [{:file/path "pages/same.md" :file/content "hello\n"}
+                    {:file/path "pages/edited.md" :file/content "old"}
+                    {:file/path "pages/gone.md" :file/content "bye"}])
+                seeded @server-graph/*seeded-snapshot
+                current (server-graph/manifest->snapshot
+                         {:entries [{:path "pages/same.md" :etag (server-graph/quote-etag hello-etag) :type "file"}
+                                    {:path "pages/edited.md" :etag "\"sha256:new\"" :type "file"}
+                                    {:path "pages/new.md" :etag "\"sha256:n\"" :type "file"}]})
+                diff (server-graph/manifest-refresh-diff seeded current
+                                                         @server-graph/*etags
+                                                         @server-graph/*published-etags)]
+          (is (= hello-etag (get @server-graph/*etags "pages/same.md")))
+          (is (= ["pages/new.md"] (mapv :path (:added diff))))
+          (is (= ["pages/edited.md"] (mapv :path (:changed diff))))
+          (is (= ["pages/gone.md"] (mapv :path (:deleted diff)))))
+        (p/handle (fn [_ error]
+                    (server-graph/clear-seed!)
+                    (when error (is (nil? error) (str error)))
+                    (done))))))
+
+(deftest watcher-first-poll-uses-the-seeded-snapshot
+  (async done
+    (let [manifest {:entries [{:path "pages/same.md" :etag (server-graph/quote-etag hello-etag) :type "file"}
+                              {:path "pages/edited.md" :etag "\"sha256:new\"" :type "file"}
+                              {:path "pages/new.md" :etag "\"sha256:n\"" :type "file"}]}
+          handler (fn [{:keys [url]}]
+                    (cond
+                      (string/includes? url "/api/graph/manifest")
+                      (response 200 (js/JSON.stringify (clj->js manifest)) {"etag" "\"rev1\""})
+
+                      :else
+                      (response 200 "remote text" {"etag" (server-graph/quote-etag "sha256:fetched")})))]
+      (-> (with-server!
+            handler
+            (fn [{:keys [requests events]}]
+              (p/let [_ (server-graph/seed-from-db-files!
+                         [{:file/path "pages/same.md" :file/content "hello\n"}
+                          {:file/path "pages/edited.md" :file/content "old"}
+                          {:file/path "pages/gone.md" :file/content "bye"}])
+                      _ (protocol/watch-dir! (server-graph/->ServerGraphFs) dir nil)
+                      _ (p/delay 50)]
+                (let [published (->> @events
+                                     (map (fn [[_ ^js event]] [(.-event event) (.-path event)]))
+                                     set)]
+                  (is (= #{["unlink" "server-graph://journal/pages/gone.md"]
+                           ["add" "server-graph://journal/pages/new.md"]
+                           ["change" "server-graph://journal/pages/edited.md"]}
+                         published))
+                  (is (not-any? #(string/includes? (:url %) "path=pages%2Fsame.md") @requests))
+                  (is (nil? @server-graph/*seeded-snapshot))))))
+          (p/handle (fn [_ _]
+                      (protocol/unwatch-dir! (server-graph/->ServerGraphFs) dir)
+                      (server-graph/clear-seed!)
+                      (done)))))))
