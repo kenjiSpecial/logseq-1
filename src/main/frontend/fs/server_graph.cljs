@@ -41,6 +41,9 @@
 ;; at a time and each uses the ETag returned by the previous one.
 (defonce *write-queues (atom {}))
 (defonce *visibility-listener (atom nil))
+;; Snapshot of the files the db was restored with, for the default dir watcher's
+;; first poll to diff the server manifest against. Consumed once by start-watch-dir!.
+(defonce *seeded-snapshot (atom nil))
 
 (defn server-graph-dir?
   [dir]
@@ -442,6 +445,54 @@
                                (when etag [path etag])))
                        files)))
 
+(defn- bytes->hex
+  [^js buffer]
+  (->> (js/Uint8Array. buffer)
+       (map #(.padStart (.toString % 16) 2 "0"))
+       (apply str)))
+
+(defn content->etag
+  "The ETag the server gives a file with this text content:
+   sha256:<hex of the UTF-8 bytes>. Resolves to [etag byte-size]."
+  [content]
+  (p/let [bytes (.encode (js/TextEncoder.) content)
+          digest (.digest js/crypto.subtle "SHA-256" bytes)]
+    [(str "sha256:" (bytes->hex digest)) (.-byteLength bytes)]))
+
+(defn db-files->snapshot
+  "Resolves to a manifest snapshot (rpath -> entry) of the watchable files in
+   the db, with the ETag each content would have on the server."
+  [db-files]
+  (p/let [entries (map-limited
+                   fetch-concurrency
+                   (fn [{:file/keys [path content last-modified-at]}]
+                     (let [rpath (normalize-path default-dir path)]
+                       (when (and (string? content)
+                                  (allowed-file? {:path rpath :type "file"}))
+                         (p/let [[etag size] (content->etag content)]
+                           {:path rpath
+                            :etag etag
+                            :size size
+                            :mtime last-modified-at
+                            :type "file"}))))
+                   db-files)]
+    (into {} (comp (remove nil?) (map (juxt :path identity))) entries)))
+
+(defn seed-from-db-files!
+  "Treats the files of a restored db as the version this tab is based on: their
+   ETags become the known ETags and the watcher's first poll diffs the manifest
+   against them, so only added, changed and deleted files are fetched.
+   Resolves to the number of files seeded."
+  [db-files]
+  (p/let [snapshot (db-files->snapshot db-files)]
+    (reset-etags! (vals snapshot))
+    (reset! *seeded-snapshot snapshot)
+    (count snapshot)))
+
+(defn clear-seed!
+  []
+  (reset! *seeded-snapshot nil))
+
 (defn- list-files
   "Every loadable file under rpath, without content."
   [rpath]
@@ -596,7 +647,8 @@
     (when-not (contains? @*watchers dir)
       (let [interval-id (js/setInterval #(poll-watch-dir! dir) poll-interval-ms)]
         (swap! *watchers assoc dir {:interval-id interval-id
-                                    :snapshot nil
+                                    :snapshot (when (= dir default-dir)
+                                                (first (reset-vals! *seeded-snapshot nil)))
                                     :polling? false})
         (poll-watch-dir! dir)))))
 

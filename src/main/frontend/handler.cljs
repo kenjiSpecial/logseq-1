@@ -29,6 +29,7 @@
             [frontend.handler.plugin-config :as plugin-config-handler]
             [frontend.handler.repo :as repo-handler]
             [frontend.handler.repo-config :as repo-config-handler]
+            [frontend.handler.search :as search-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
             [frontend.idb :as idb]
@@ -83,19 +84,49 @@
    :file/size size
    :file/last-modified-at mtime})
 
+(defn- seed-server-graph-from-db!
+  "Resolves to true when the db restored for repo already holds the graph's
+   files and the server graph watcher was seeded with them, false when the
+   graph has to be loaded from the server."
+  [repo]
+  (let [db-files (seq (filter #(string? (:file/content %)) (db/get-files-full repo)))]
+    (if-not db-files
+      (p/resolved false)
+      (-> (p/let [seeded (server-graph/seed-from-db-files! db-files)]
+            (log/info :server-graph/cached-boot {:files seeded})
+            (pos? seeded))
+          (p/catch (fn [error]
+                     (log/error :server-graph/cached-boot-failed error)
+                     (server-graph/clear-seed!)
+                     false))))))
+
+(defn- load-server-graph-from-server!
+  "Fetches every file and parses it into a new db. The :graph/added event this
+   ends with persists the db, so the next startup can use it."
+  [repo]
+  (p/let [repo-dir (config/get-repo-dir repo)
+          result (fs/get-files repo-dir)
+          file-objs (mapv server-graph-file->db-file (:files result))]
+    (repo-handler/start-repo-db-if-not-exists! repo)
+    (repo-handler/load-new-repo-to-db!
+     repo
+     {:new-graph? true
+      :empty-graph? (empty? file-objs)
+      :file-objs file-objs})))
+
 (defn- load-server-graph!
+  "Uses the db restored from the previous visit when it has the graph's files;
+   the server graph watcher's first poll then brings it up to date with the
+   files added, changed or deleted since. Otherwise loads the whole graph."
   [repo]
   (when (and (server-graph/enabled?)
              (= repo server-graph/default-repo))
-    (p/let [repo-dir (config/get-repo-dir repo)
-            result (fs/get-files repo-dir)
-            file-objs (mapv server-graph-file->db-file (:files result))]
-      (repo-handler/start-repo-db-if-not-exists! repo)
-      (repo-handler/load-new-repo-to-db!
-       repo
-       {:new-graph? true
-        :empty-graph? (empty? file-objs)
-        :file-objs file-objs}))))
+    (p/let [cached? (seed-server-graph-from-db! repo)]
+      (if cached?
+        (-> (search-handler/rebuild-indices!)
+            (p/catch (fn [error]
+                       (log/error :server-graph/search-rebuild-failed error))))
+        (load-server-graph-from-server! repo)))))
 
 (defn- refresh-journal-local-graph-from-pull!
   [{:keys [downloadedPaths] :as summary}]
